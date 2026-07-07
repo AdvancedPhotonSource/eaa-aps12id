@@ -1,0 +1,27 @@
+[project]
+name = "eaa-aps12id"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ming Du", email = "mingdu@anl.gov" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "eaa-core",
+    "eaa-imaging",
+]
+
+[tool.uv.sources]
+eaa-core = { git = "https://github.com/AdvancedPhotonSource/EAA.git", branch = "main", subdirectory = "packages/eaa-core" }
+eaa-imaging = { git = "https://github.com/AdvancedPhotonSource/EAA.git", branch = "main", subdirectory = "packages/eaa-imaging" }
+
+[project.scripts]
+eaa-aps12id = "eaa_aps12id:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
