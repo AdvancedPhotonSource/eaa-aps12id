@@ -662,6 +662,16 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         panels: list[tuple[str, np.ndarray, np.ndarray | None]] = [
             ("Posterior uncertainty", self.candidate_positions, uncertainty),
             (
+                "Log-det diversity",
+                scores.positions if scores is not None else self.candidate_positions,
+                scores.q_div_tilde if scores is not None else None,
+            ),
+            (
+                "Gradient",
+                scores.positions if scores is not None else self.candidate_positions,
+                scores.gradient_tilde if scores is not None else None,
+            ),
+            (
                 "PC1 posterior mean",
                 self.candidate_positions,
                 mean[:, 0] if mean.shape[1] >= 1 else None,
@@ -675,16 +685,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 "PC3 posterior mean",
                 self.candidate_positions,
                 mean[:, 2] if mean.shape[1] >= 3 else None,
-            ),
-            (
-                "Log-det diversity",
-                scores.positions if scores is not None else self.candidate_positions,
-                scores.q_div_tilde if scores is not None else None,
-            ),
-            (
-                "Gradient",
-                scores.positions if scores is not None else self.candidate_positions,
-                scores.gradient_tilde if scores is not None else None,
             ),
         ]
         sampled_positions = self.measured_positions
