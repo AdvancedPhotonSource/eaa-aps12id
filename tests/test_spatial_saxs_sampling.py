@@ -1,0 +1,240 @@
+import importlib.util
+
+import numpy as np
+import pytest
+
+from eaa_aps12id.task_managers.spatial_saxs_sampling import (
+    SpatialSAXSAdaptiveSamplingTaskManager,
+)
+from eaa_core.gui.runtime import WebUIRuntimeController
+from eaa_core.tool.base import BaseTool
+
+
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None
+    or importlib.util.find_spec("botorch") is None
+    or importlib.util.find_spec("gpytorch") is None,
+    reason="torch, botorch, and gpytorch are required for spatial SAXS tests",
+)
+
+
+class DummySAXSTool(BaseTool):
+    def __init__(self):
+        self.calls = []
+
+    def acquire_saxs(self, x, y, q_min, q_max, q_step=None, exposure=None):
+        self.calls.append(
+            {
+                "x": x,
+                "y": y,
+                "q_min": q_min,
+                "q_max": q_max,
+                "q_step": q_step,
+                "exposure": exposure,
+            }
+        )
+        q = np.geomspace(q_min, q_max, 64)
+        intensity = 1.0 + 0.2 * x + 0.1 * y + np.exp(-((np.log(q) + 2.0) ** 2))
+        return q, intensity
+
+
+def default_sampling_kwargs(**kwargs):
+    params = {
+        "x_values": [0.0, 1.0, 2.0],
+        "y_values": [0.0, 1.0, 2.0],
+        "q_min": 0.01,
+        "q_max": 1.0,
+        "num_q_points": 16,
+        "num_initial_samples": 3,
+        "max_measurements": 5,
+        "num_pca_components": 2,
+        "num_mc_samples": 4,
+        "random_seed": 1,
+    }
+    params.update(kwargs)
+    return params
+
+
+def make_manager(**kwargs):
+    params = {
+        "acquisition_tool": DummySAXSTool(),
+        "checkpoint_db_path": None,
+        "build": False,
+    }
+    params.update(kwargs)
+    return SpatialSAXSAdaptiveSamplingTaskManager(**params)
+
+
+def configure_manager(manager, **kwargs):
+    manager._configure_sampling_run(**default_sampling_kwargs(**kwargs))
+    return manager
+
+
+def test_preprocess_spectrum_interpolates_and_log_transforms():
+    manager = configure_manager(make_manager())
+    q = np.geomspace(0.005, 1.5, 8)
+    intensity = q * 2.0
+
+    spectrum = manager.preprocess_spectrum(q[::-1], intensity[::-1])
+
+    expected = np.log(
+        np.interp(manager.q_grid, q, intensity) + manager.epsilon_intensity
+    )
+    np.testing.assert_allclose(spectrum, expected)
+
+
+def test_preprocess_spectrum_rejects_insufficient_q_coverage():
+    manager = configure_manager(make_manager())
+    q = np.geomspace(0.02, 0.8, 6)
+    intensity = np.ones_like(q)
+
+    with pytest.raises(ValueError, match="does not cover"):
+        manager.preprocess_spectrum(q, intensity)
+
+
+def test_initial_sobol_selection_is_unique_and_deterministic():
+    manager_a = configure_manager(make_manager(), random_seed=10)
+    manager_b = configure_manager(make_manager(), random_seed=10)
+
+    indices_a = manager_a.get_initial_candidate_indices()
+    indices_b = manager_b.get_initial_candidate_indices()
+
+    assert indices_a == indices_b
+    assert len(indices_a) == manager_a.num_initial_samples
+    assert len(set(indices_a)) == manager_a.num_initial_samples
+
+
+def test_pca_and_standardization_shapes():
+    manager = configure_manager(make_manager())
+    spectra = np.vstack(
+        [
+            np.linspace(0, 1, manager.num_q_points),
+            np.linspace(1, 0, manager.num_q_points),
+            np.sin(np.linspace(0, np.pi, manager.num_q_points)),
+            np.cos(np.linspace(0, np.pi, manager.num_q_points)),
+        ]
+    )
+
+    import torch
+
+    manager.fit_pca(torch.as_tensor(spectra, dtype=torch.double))
+    manager.standardize_latent_scores()
+
+    assert manager.pca_components.shape == (
+        manager.num_pca_components,
+        manager.num_q_points,
+    )
+    assert manager.standardized_latent_scores.shape == (4, manager.num_pca_components)
+    np.testing.assert_allclose(
+        manager.standardized_latent_scores.mean(dim=0).detach().numpy(),
+        np.zeros(manager.num_pca_components),
+        atol=1e-12,
+    )
+
+
+def test_logdet_diversity_gain_matches_explicit_recompute():
+    manager = configure_manager(make_manager())
+
+    import torch
+
+    current = torch.tensor(
+        [[-1.0, 0.0], [0.0, 1.0], [1.0, -1.0]], dtype=torch.double
+    )
+    candidates = torch.tensor([[0.5, 0.5], [2.0, -1.0]], dtype=torch.double)
+
+    gains = manager.logdet_diversity_gain(current, candidates)
+
+    current_centered = current - current.mean(dim=0)
+    base = (
+        manager.lambda_logdet
+        * torch.eye(manager.num_pca_components, dtype=torch.double)
+        + current_centered.T @ current_centered
+    )
+    expected = []
+    for candidate in candidates:
+        appended = torch.cat([current, candidate[None, :]], dim=0)
+        appended_centered = appended - appended.mean(dim=0)
+        new = (
+            manager.lambda_logdet
+            * torch.eye(manager.num_pca_components, dtype=torch.double)
+            + appended_centered.T @ appended_centered
+        )
+        expected.append(torch.logdet(new) - torch.logdet(base))
+    expected = torch.stack(expected)
+
+    torch.testing.assert_close(gains, expected)
+
+
+def test_run_collects_unique_measurements():
+    manager = make_manager()
+
+    manager.run(
+        **default_sampling_kwargs(
+            num_q_points=8,
+            num_mc_samples=2,
+            max_measurements=4,
+        )
+    )
+
+    assert len(manager.measurements) == 4
+    assert len(set(manager.measured_candidate_indices)) == 4
+    assert manager.latest_scores is not None
+
+
+def test_run_forwards_non_position_acquisition_kwargs():
+    manager = make_manager()
+
+    manager.run(
+        **default_sampling_kwargs(
+            num_q_points=8,
+            num_mc_samples=2,
+            max_measurements=4,
+        ),
+        non_position_kwargs_for_acquisition_tool={
+            "q_min": 0.01,
+            "q_max": 1.0,
+            "q_step": 0.001,
+            "exposure": 0.5,
+        }
+    )
+
+    assert manager.acquisition_tool.calls
+    assert all(call["q_step"] == 0.001 for call in manager.acquisition_tool.calls)
+    assert all(call["exposure"] == 0.5 for call in manager.acquisition_tool.calls)
+
+
+def test_run_publishes_webui_progress_and_posterior_tile(tmp_path):
+    manager = make_manager()
+    manager.runtime_controller = WebUIRuntimeController(
+        manager,
+        upload_dir=str(tmp_path),
+    )
+    manager.runtime_controller.build()
+
+    manager.run(
+        **default_sampling_kwargs(
+            num_q_points=8,
+            num_mc_samples=2,
+            max_measurements=4,
+        )
+    )
+
+    snapshot = manager.runtime_controller.snapshot()
+    messages = snapshot["messages"]
+    assert any(
+        message["content"].startswith("Starting adaptive SAXS sampling")
+        for message in messages
+    )
+    assert any(
+        message["content"] == "Gaussian process model update complete."
+        for message in messages
+    )
+    primary = next(
+        conversation
+        for conversation in snapshot["conversations"]
+        if conversation["id"] == "primary"
+    )
+    assert len(primary["visualization_tiles"]) == 2
+    for tile in primary["visualization_tiles"]:
+        assert tile["content"]["type"] == "image"
+        assert tile["content"]["image_path"].endswith(".png")

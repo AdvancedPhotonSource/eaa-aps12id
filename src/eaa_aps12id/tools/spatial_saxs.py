@@ -202,7 +202,8 @@ class SimulatedSpatialSAXS(BaseTool):
         self.interpolator = RegularGridInterpolator(
             (self.y_values, self.x_values),
             self.intensity_grid,
-            bounds_error=True,
+            bounds_error=False,
+            fill_value=None,
         )
 
     @tool(name="simulated_spatial_saxs.acquire_saxs")

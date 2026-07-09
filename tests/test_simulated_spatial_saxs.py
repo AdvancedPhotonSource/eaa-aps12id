@@ -101,12 +101,14 @@ def test_incomplete_grid_raises(tmp_path):
         SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
 
-def test_out_of_bounds_position_raises(tmp_path):
+def test_out_of_bounds_position_extrapolates(tmp_path):
     write_scan(tmp_path)
     tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    with pytest.raises(ValueError):
-        tool.acquire_saxs(x=2.0, y=0.5, q_min=0.0, q_max=2.0, q_step=1.0)
+    q, intensity = tool.acquire_saxs(x=2.0, y=0.5, q_min=0.0, q_max=2.0, q_step=1.0)
+
+    np.testing.assert_allclose(q, [0.0, 1.0])
+    np.testing.assert_allclose(intensity, [30.0, 31.0])
 
 
 def test_inconsistent_q_grid_raises(tmp_path):
