@@ -108,7 +108,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.num_mc_samples: int | None = None
         self.w_d: float | None = None
         self.w_g: float | None = None
-        self.epsilon: float | None = None
+        self.epsilon_acquisition: float | None = None
+        self.epsilon_normalization: float | None = None
         self.epsilon_z: float | None = None
         self.random_seed: int | None = None
         self.q_grid: np.ndarray | None = None
@@ -168,7 +169,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         num_mc_samples: int = 64,
         w_d: float = 1.0,
         w_g: float = 1.0,
-        epsilon: float = 1e-12,
+        epsilon_acquisition: float = 1e-3,
+        epsilon_normalization: float = 1e-12,
         epsilon_z: float = 1e-12,
         random_seed: int | None = None,
     ) -> None:
@@ -189,7 +191,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "num_mc_samples": int(num_mc_samples),
             "w_d": float(w_d),
             "w_g": float(w_g),
-            "epsilon": float(epsilon),
+            "epsilon_acquisition": float(epsilon_acquisition),
+            "epsilon_normalization": float(epsilon_normalization),
             "epsilon_z": float(epsilon_z),
             "random_seed": random_seed,
         }
@@ -218,7 +221,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.num_mc_samples = config["num_mc_samples"]
         self.w_d = config["w_d"]
         self.w_g = config["w_g"]
-        self.epsilon = config["epsilon"]
+        self.epsilon_acquisition = config["epsilon_acquisition"]
+        self.epsilon_normalization = config["epsilon_normalization"]
         self.epsilon_z = config["epsilon_z"]
         self.random_seed = random_seed
         self._validate_parameters()
@@ -263,8 +267,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError("`lambda_logdet` must be positive.")
         if self.num_mc_samples < 1:
             raise ValueError("`num_mc_samples` must be positive.")
-        if self.epsilon <= 0 or self.epsilon_z <= 0:
-            raise ValueError("`epsilon` and `epsilon_z` must be positive.")
+        if self.epsilon_acquisition <= 0:
+            raise ValueError("`epsilon_acquisition` must be positive.")
+        if self.epsilon_normalization <= 0 or self.epsilon_z <= 0:
+            raise ValueError(
+                "`epsilon_normalization` and `epsilon_z` must be positive."
+            )
 
     def create_log_q_grid(self) -> np.ndarray:
         """Return the common log-spaced q grid."""
@@ -294,7 +302,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         num_mc_samples: int = 64,
         w_d: float = 1.0,
         w_g: float = 1.0,
-        epsilon: float = 1e-12,
+        epsilon_acquisition: float = 1e-3,
+        epsilon_normalization: float = 1e-12,
         epsilon_z: float = 1e-12,
         random_seed: int | None = None,
         n_iterations: int | None = None,
@@ -334,7 +343,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Diversity acquisition weight.
         w_g : float
             Spatial-gradient acquisition weight.
-        epsilon : float
+        epsilon_acquisition : float
+            Positive uncertainty baseline in the acquisition function.
+        epsilon_normalization : float
             Numerical constant for normalization denominators.
         epsilon_z : float
             Numerical constant for latent standardization denominators.
@@ -364,7 +375,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             num_mc_samples=num_mc_samples,
             w_d=w_d,
             w_g=w_g,
-            epsilon=epsilon,
+            epsilon_acquisition=epsilon_acquisition,
+            epsilon_normalization=epsilon_normalization,
             epsilon_z=epsilon_z,
             random_seed=random_seed,
         )
@@ -955,7 +967,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         gradient_tilde = self.normalize_tensor(gradient)
         q_div_tilde = self.normalize_tensor(q_div)
         acquisition = sigma_tilde * (
-            self.w_d * q_div_tilde + self.w_g * gradient_tilde
+            self.w_d * q_div_tilde
+            + self.w_g * gradient_tilde
+            + self.epsilon_acquisition
         )
         scores = AcquisitionScores(
             positions=self.candidate_positions[unsampled_indices].copy(),
@@ -1033,9 +1047,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return gains.reshape(candidates.shape[:-1])
 
     def normalize_tensor(self, values: "torch.Tensor") -> "torch.Tensor":
-        """Min-max normalize a tensor with the configured epsilon."""
+        """Min-max normalize a tensor with the configured normalization epsilon."""
         self._require_sampling_configured()
-        return (values - values.min()) / (values.max() - values.min() + self.epsilon)
+        return (values - values.min()) / (
+            values.max() - values.min() + self.epsilon_normalization
+        )
 
     def get_candidate_index(self, position: np.ndarray) -> int:
         """Return the exact candidate index for a mesh position."""

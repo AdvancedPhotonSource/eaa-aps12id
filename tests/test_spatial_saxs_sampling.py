@@ -183,6 +183,37 @@ def test_run_collects_unique_measurements():
     assert manager.latest_scores is not None
 
 
+def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
+    manager = configure_manager(
+        make_manager(),
+        w_d=0.0,
+        w_g=0.0,
+    )
+
+    import torch
+
+    class Posterior:
+        mean = torch.zeros(9, 2, dtype=torch.double)
+        variance = torch.arange(1, 10, dtype=torch.double).unsqueeze(-1).repeat(1, 2)
+
+    class GPModel:
+        @staticmethod
+        def posterior(candidate_x):
+            return Posterior()
+
+    manager.gp_model = GPModel()
+    manager.compute_latent_gradient_magnitude = lambda candidate_x: torch.ones(9)
+    manager.compute_expected_logdet_diversity = lambda posterior: torch.ones(9)
+
+    scores = manager.compute_acquisition_scores()
+
+    assert manager.epsilon_acquisition == 1e-3
+    np.testing.assert_allclose(
+        scores.acquisition,
+        manager.epsilon_acquisition * scores.sigma_tilde,
+    )
+
+
 def test_run_forwards_non_position_acquisition_kwargs():
     manager = make_manager()
 
