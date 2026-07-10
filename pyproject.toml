@@ -19,6 +19,12 @@ dependencies = [
 [tool.uv.sources]
 eaa-core = { git = "https://github.com/AdvancedPhotonSource/EAA.git", branch = "main", subdirectory = "packages/eaa-core" }
 eaa-imaging = { git = "https://github.com/AdvancedPhotonSource/EAA.git", branch = "main", subdirectory = "packages/eaa-imaging" }
+torch = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
 
 [project.scripts]
 eaa-aps12id = "eaa_aps12id:main"
