@@ -117,16 +117,18 @@ def test_pca_and_standardization_shapes():
 
     import torch
 
-    manager.fit_pca(torch.as_tensor(spectra, dtype=torch.double))
-    manager.standardize_latent_scores()
-
-    assert manager.pca_components.shape == (
+    latent_scores = manager.fit_pca(
+        torch.as_tensor(spectra, dtype=torch.double),
         manager.num_pca_components,
-        manager.num_q_points,
     )
-    assert manager.standardized_latent_scores.shape == (4, manager.num_pca_components)
+    standardized_latent_scores = manager.standardize_latent_scores(
+        latent_scores, manager.epsilon_z
+    )
+
+    assert latent_scores.shape == (4, manager.num_pca_components)
+    assert standardized_latent_scores.shape == (4, manager.num_pca_components)
     np.testing.assert_allclose(
-        manager.standardized_latent_scores.mean(dim=0).detach().numpy(),
+        standardized_latent_scores.mean(dim=0).detach().numpy(),
         np.zeros(manager.num_pca_components),
         atol=1e-12,
     )

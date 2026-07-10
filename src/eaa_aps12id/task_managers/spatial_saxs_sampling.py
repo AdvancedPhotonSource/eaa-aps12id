@@ -118,11 +118,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.candidate_positions_normalized: np.ndarray | None = None
         self.measurements: list[SAXSMeasurement] = []
         self.measured_candidate_indices: list[int] = []
-        self.pca_mean: torch.Tensor | None = None
-        self.pca_components: torch.Tensor | None = None
-        self.latent_mean: torch.Tensor | None = None
-        self.latent_std: torch.Tensor | None = None
-        self.latent_scores: torch.Tensor | None = None
         self.standardized_latent_scores: torch.Tensor | None = None
         self.gp_model = None
         self.latest_scores: AcquisitionScores | None = None
@@ -563,9 +558,21 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             np.vstack([measurement.spectrum for measurement in self.measurements]),
             dtype=torch.double,
         )
-        self.fit_pca(spectra)
-        self.standardize_latent_scores()
-        self.fit_gp()
+        latent_scores = self.fit_pca(spectra, self.num_pca_components)
+        standardized_latent_scores = self.standardize_latent_scores(
+            latent_scores, self.epsilon_z
+        )
+        train_x = torch.as_tensor(
+            self.normalize_positions(self.measured_positions),
+            dtype=torch.double,
+        )
+        gp_model = self.fit_gp(
+            train_x,
+            standardized_latent_scores,
+            self.num_pca_components,
+        )
+        self.standardized_latent_scores = standardized_latent_scores
+        self.gp_model = gp_model
         self._record_progress_message("Gaussian process model update complete.")
         self.publish_posterior_visualization()
 
@@ -804,49 +811,90 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         """Record a progress message locally and in the WebUI."""
         self.record_system_message(message, update_context=False)
 
-    def fit_pca(self, spectra: "torch.Tensor") -> None:
-        """Fit PCA on preprocessed spectra with ``torch.linalg.svd``."""
-        self._require_sampling_configured()
-        if spectra.shape[0] <= self.num_pca_components:
+    @staticmethod
+    def fit_pca(
+        spectra: "torch.Tensor", num_pca_components: int
+    ) -> "torch.Tensor":
+        """Fit PCA and project the spectra into its latent space.
+
+        Parameters
+        ----------
+        spectra : torch.Tensor
+            Preprocessed spectra with shape ``(N, N_q)``.
+        num_pca_components : int
+            Number of principal components to retain.
+
+        Returns
+        -------
+        torch.Tensor
+            PCA projections with shape ``(N, num_pca_components)``.
+        """
+        if spectra.shape[0] <= num_pca_components:
             raise ValueError("Need more measured spectra than PCA components.")
-        self.pca_mean = spectra.mean(dim=0)
-        centered = spectra - self.pca_mean
+        pca_mean = spectra.mean(dim=0)
+        centered = spectra - pca_mean
         _, _, vh = torch.linalg.svd(centered, full_matrices=False)
-        self.pca_components = vh[: self.num_pca_components]
-        self.latent_scores = centered @ self.pca_components.T
+        pca_components = vh[:num_pca_components]
+        return centered @ pca_components.T
 
-    def standardize_latent_scores(self) -> None:
-        """Standardize PCA scores dimension-wise for GP training."""
-        self._require_sampling_configured()
-        if self.latent_scores is None:
-            raise ValueError("PCA must be fit before latent standardization.")
-        self.latent_mean = self.latent_scores.mean(dim=0)
-        self.latent_std = self.latent_scores.std(dim=0, unbiased=True)
-        self.standardized_latent_scores = (
-            self.latent_scores - self.latent_mean
-        ) / (self.latent_std + self.epsilon_z)
+    @staticmethod
+    def standardize_latent_scores(
+        latent_scores: "torch.Tensor", epsilon_z: float
+    ) -> "torch.Tensor":
+        """Standardize PCA scores dimension-wise for GP training.
 
-    def fit_gp(self) -> None:
-        """Fit the joint multi-output GP in normalized position space."""
-        self._require_sampling_configured()
-        train_x = torch.as_tensor(
-            self.normalize_positions(self.measured_positions),
-            dtype=torch.double,
-        )
-        train_y = self.standardized_latent_scores.double()
+        Parameters
+        ----------
+        latent_scores : torch.Tensor
+            PCA projections with shape ``(N, N_pcs)``.
+        epsilon_z : float
+            Stabilizing value added to each latent standard deviation.
+
+        Returns
+        -------
+        torch.Tensor
+            Standardized PCA projections with the same shape as ``latent_scores``.
+        """
+        latent_mean = latent_scores.mean(dim=0)
+        latent_std = latent_scores.std(dim=0, unbiased=True)
+        return (latent_scores - latent_mean) / (latent_std + epsilon_z)
+
+    @staticmethod
+    def fit_gp(
+        train_x: "torch.Tensor",
+        train_y: "torch.Tensor",
+        num_pca_components: int,
+    ) -> Any:
+        """Fit the joint multi-output GP in normalized position space.
+
+        Parameters
+        ----------
+        train_x : torch.Tensor
+            Normalized measured positions with shape ``(N, 2)``.
+        train_y : torch.Tensor
+            Standardized PCA projections with shape ``(N, N_pcs)``.
+        num_pca_components : int
+            Number of modeled PCA components.
+
+        Returns
+        -------
+        KroneckerMultiTaskGP
+            Fitted multi-output Gaussian process model.
+        """
         data_kernel = ScaleKernel(
             MaternKernel(nu=2.5, ard_num_dims=2),
         )
-        self.gp_model = KroneckerMultiTaskGP(
+        gp_model = KroneckerMultiTaskGP(
             train_X=train_x,
-            train_Y=train_y,
+            train_Y=train_y.double(),
             data_covar_module=data_kernel,
-            rank=self.num_pca_components,
+            rank=num_pca_components,
             outcome_transform=None,
         )
-        mll = ExactMarginalLogLikelihood(self.gp_model.likelihood, self.gp_model)
+        mll = ExactMarginalLogLikelihood(gp_model.likelihood, gp_model)
         fit_gpytorch_mll(mll)
-        self.gp_model.eval()
+        gp_model.eval()
+        return gp_model
 
     @property
     def measured_positions(self) -> np.ndarray:
