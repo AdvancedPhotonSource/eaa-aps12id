@@ -929,7 +929,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         scores = self.compute_acquisition_scores()
         if k > scores.positions.shape[0]:
             raise ValueError("`k` cannot exceed the number of unsampled candidates.")
-        order = np.lexsort((np.arange(scores.acquisition.size), -scores.acquisition))
+        order = np.argsort(-scores.acquisition, kind="stable")
         return scores.positions[order[:k]].copy()
 
     def compute_acquisition_scores(self) -> AcquisitionScores:
