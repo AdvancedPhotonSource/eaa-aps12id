@@ -442,7 +442,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ):
             sobol = engine.draw(max_draws).double()
             candidates = torch.as_tensor(
-                self.candidate_positions_normalized, dtype=torch.double
+                self.candidate_positions_normalized,
+                dtype=torch.double,
+                device=sobol.device,
             )
             distances = torch.cdist(sobol, candidates)
             nearest = torch.argmin(distances, dim=1).detach().cpu().numpy()
