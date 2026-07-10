@@ -1,6 +1,9 @@
 *.pyc
 *.egg-info
 
+AGENTS.md
+
 workspace/
+*.sqlite
 
 .loglogin
