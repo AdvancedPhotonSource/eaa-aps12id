@@ -651,7 +651,7 @@ requires-dist = [
 [[package]]
 name = "eaa-core"
 version = "1.0.0"
-source = { git = "https://github.com/AdvancedPhotonSource/EAA.git?subdirectory=packages%2Feaa-core&branch=main#cd69359a8a2af0bb13438872afad96b98f52739c" }
+source = { git = "https://github.com/AdvancedPhotonSource/EAA.git?subdirectory=packages%2Feaa-core&branch=main#30bf1665be05494caec18f3773cd6dcf63684318" }
 dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
@@ -671,7 +671,7 @@ dependencies = [
 [[package]]
 name = "eaa-imaging"
 version = "1.0.0"
-source = { git = "https://github.com/AdvancedPhotonSource/EAA.git?subdirectory=packages%2Feaa-imaging&branch=main#cd69359a8a2af0bb13438872afad96b98f52739c" }
+source = { git = "https://github.com/AdvancedPhotonSource/EAA.git?subdirectory=packages%2Feaa-imaging&branch=main#30bf1665be05494caec18f3773cd6dcf63684318" }
 dependencies = [
     { name = "eaa-core" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
