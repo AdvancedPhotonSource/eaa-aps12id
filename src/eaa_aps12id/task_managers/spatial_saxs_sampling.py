@@ -119,6 +119,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.candidate_positions_normalized: np.ndarray | None = None
         self.measurements: list[SAXSMeasurement] = []
         self.measured_candidate_indices: list[int] = []
+        self.excluded_measurement_indices: set[int] = set()
         self.standardized_latent_scores: torch.Tensor | None = None
         self.gp_model = None
         self.latest_scores: AcquisitionScores | None = None
@@ -564,12 +565,50 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     def refit_model(self) -> None:
         """Refit PCA, latent standardization, and the joint multi-output GP."""
         self._require_sampling_configured()
+        fitting_indices = [
+            index
+            for index in range(len(self.measurements))
+            if index not in self.excluded_measurement_indices
+        ]
         self._record_progress_message(
-            f"Updating PCA and Gaussian process model with {len(self.measurements)} "
+            f"Updating PCA and Gaussian process model with {len(fitting_indices)} "
             "measurements."
         )
+        try:
+            standardized_latent_scores, gp_model = self._fit_model(
+                fitting_indices, fit_mll=True
+            )
+        except RuntimeError as exc:
+            if "Must provide inverse transform" not in str(exc):
+                raise
+            excluded_index = fitting_indices[-1]
+            self.excluded_measurement_indices.add(excluded_index)
+            fitting_indices.remove(excluded_index)
+            message = (
+                "MLL fitting failed while adding measurement "
+                f"{excluded_index + 1}; excluding it from current and future "
+                "model fits."
+            )
+            logger.warning("%s Error: %s", message, exc)
+            self._record_progress_message(message)
+            standardized_latent_scores, gp_model = self._fit_model(
+                fitting_indices, fit_mll=False
+            )
+        self.standardized_latent_scores = standardized_latent_scores
+        self.gp_model = gp_model
+        self._record_progress_message("Gaussian process model update complete.")
+        self.publish_posterior_visualization()
+
+    def _fit_model(
+        self,
+        measurement_indices: list[int],
+        fit_mll: bool,
+    ) -> tuple[torch.Tensor, Any]:
+        """Fit PCA and a GP using the selected measurements."""
         spectra = torch.as_tensor(
-            np.vstack([measurement.spectrum for measurement in self.measurements]),
+            np.vstack(
+                [self.measurements[index].spectrum for index in measurement_indices]
+            ),
             dtype=torch.double,
         )
         latent_scores = self.fit_pca(spectra, self.num_pca_components)
@@ -577,18 +616,23 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             latent_scores, self.epsilon_z
         )
         train_x = torch.as_tensor(
-            self.normalize_positions(self.measured_positions),
+            self.normalize_positions(
+                np.vstack(
+                    [
+                        self.measurements[index].position
+                        for index in measurement_indices
+                    ]
+                )
+            ),
             dtype=torch.double,
         )
         gp_model = self.fit_gp(
             train_x,
             standardized_latent_scores,
             self.num_pca_components,
+            fit_mll=fit_mll,
         )
-        self.standardized_latent_scores = standardized_latent_scores
-        self.gp_model = gp_model
-        self._record_progress_message("Gaussian process model update complete.")
-        self.publish_posterior_visualization()
+        return standardized_latent_scores, gp_model
 
     def publish_posterior_visualization(self) -> None:
         """Publish the posterior status figure to the WebUI visualization tile."""
@@ -878,6 +922,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         train_x: "torch.Tensor",
         train_y: "torch.Tensor",
         num_pca_components: int,
+        fit_mll: bool = True,
     ) -> Any:
         """Fit the joint multi-output GP in normalized position space.
 
@@ -889,6 +934,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Standardized PCA projections with shape ``(N, N_pcs)``.
         num_pca_components : int
             Number of modeled PCA components.
+        fit_mll : bool
+            Whether to optimize the marginal log likelihood.
 
         Returns
         -------
@@ -905,8 +952,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             rank=num_pca_components,
             outcome_transform=None,
         )
-        mll = ExactMarginalLogLikelihood(gp_model.likelihood, gp_model)
-        fit_gpytorch_mll(mll)
+        if fit_mll:
+            mll = ExactMarginalLogLikelihood(gp_model.likelihood, gp_model)
+            fit_gpytorch_mll(mll)
         gp_model.eval()
         return gp_model
 

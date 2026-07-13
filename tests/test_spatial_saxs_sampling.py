@@ -183,6 +183,37 @@ def test_run_collects_unique_measurements():
     assert manager.latest_scores is not None
 
 
+def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
+    manager = configure_manager(make_manager())
+    for candidate_index in range(3):
+        manager.measure_candidate(candidate_index)
+
+    calls = []
+
+    def fake_fit_gp(train_x, train_y, num_pca_components, fit_mll=True):
+        calls.append((train_x.shape[0], fit_mll))
+        if train_x.shape[0] == 4 and fit_mll and len(manager.measurements) == 4:
+            raise RuntimeError(
+                "Must provide inverse transform to be able to sample from prior."
+            )
+        return object()
+
+    monkeypatch.setattr(manager, "fit_gp", fake_fit_gp)
+    manager.refit_model()
+    manager.measure_candidate(3)
+
+    manager.refit_model()
+
+    assert manager.excluded_measurement_indices == {3}
+    assert calls[-2:] == [(4, True), (3, False)]
+
+    manager.measure_candidate(4)
+    manager.refit_model()
+
+    assert calls[-1] == (4, True)
+    assert manager.excluded_measurement_indices == {3}
+
+
 def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
     manager = configure_manager(
         make_manager(),
