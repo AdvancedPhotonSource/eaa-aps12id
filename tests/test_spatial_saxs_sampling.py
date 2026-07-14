@@ -47,7 +47,7 @@ def default_sampling_kwargs(**kwargs):
         "num_q_points": 16,
         "num_initial_samples": 3,
         "max_measurements": 5,
-        "num_pca_components": 2,
+        "num_components": 2,
         "num_mc_samples": 4,
         "random_seed": 1,
     }
@@ -104,7 +104,12 @@ def test_initial_sobol_selection_is_unique_and_deterministic():
     assert len(set(indices_a)) == manager_a.num_initial_samples
 
 
-def test_pca_and_standardization_shapes():
+@pytest.mark.parametrize(
+    "dimension_reduction_method", ["pca", "sparse_pca", "nmf"]
+)
+def test_dimensionality_reduction_and_standardization_shapes(
+    dimension_reduction_method,
+):
     manager = configure_manager(make_manager())
     spectra = np.vstack(
         [
@@ -117,21 +122,28 @@ def test_pca_and_standardization_shapes():
 
     import torch
 
-    latent_scores = manager.fit_pca(
+    latent_scores = manager.fit_dimensionality_reduction(
         torch.as_tensor(spectra, dtype=torch.double),
-        manager.num_pca_components,
+        manager.num_components,
+        dimension_reduction_method,
+        random_seed=manager.random_seed,
     )
     standardized_latent_scores = manager.standardize_latent_scores(
         latent_scores, manager.epsilon_z
     )
 
-    assert latent_scores.shape == (4, manager.num_pca_components)
-    assert standardized_latent_scores.shape == (4, manager.num_pca_components)
+    assert latent_scores.shape == (4, manager.num_components)
+    assert standardized_latent_scores.shape == (4, manager.num_components)
     np.testing.assert_allclose(
-        standardized_latent_scores.mean(dim=0).detach().numpy(),
-        np.zeros(manager.num_pca_components),
+        standardized_latent_scores.mean(dim=0).detach().cpu().numpy(),
+        np.zeros(manager.num_components),
         atol=1e-12,
     )
+
+
+def test_configure_rejects_unknown_dimensionality_reduction_method():
+    with pytest.raises(ValueError, match="`dimension_reduction_method` must be one of"):
+        configure_manager(make_manager(), dimension_reduction_method="tsne")
 
 
 def test_logdet_diversity_gain_matches_explicit_recompute():
@@ -149,7 +161,7 @@ def test_logdet_diversity_gain_matches_explicit_recompute():
     current_centered = current - current.mean(dim=0)
     base = (
         manager.lambda_logdet
-        * torch.eye(manager.num_pca_components, dtype=torch.double)
+        * torch.eye(manager.num_components, dtype=torch.double)
         + current_centered.T @ current_centered
     )
     expected = []
@@ -158,7 +170,7 @@ def test_logdet_diversity_gain_matches_explicit_recompute():
         appended_centered = appended - appended.mean(dim=0)
         new = (
             manager.lambda_logdet
-            * torch.eye(manager.num_pca_components, dtype=torch.double)
+            * torch.eye(manager.num_components, dtype=torch.double)
             + appended_centered.T @ appended_centered
         )
         expected.append(torch.logdet(new) - torch.logdet(base))
@@ -190,7 +202,13 @@ def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
 
     calls = []
 
-    def fake_fit_gp(train_x, train_y, num_pca_components, fit_mll=True):
+    def fake_fit_gp(
+        train_x,
+        train_y,
+        n_task_covar_ranks=None,
+        max_fit_gp_mll_iterations=None,
+        fit_mll=True,
+    ):
         calls.append((train_x.shape[0], fit_mll))
         if train_x.shape[0] == 4 and fit_mll and len(manager.measurements) == 4:
             raise RuntimeError(
@@ -212,6 +230,47 @@ def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
 
     assert calls[-1] == (4, True)
     assert manager.excluded_measurement_indices == {3}
+
+
+def test_fit_gp_configures_task_rank_and_mll_iterations(monkeypatch):
+    import torch
+
+    calls = []
+    monkeypatch.setattr(
+        "eaa_aps12id.task_managers.spatial_saxs_sampling.fit_gpytorch_mll",
+        lambda mll, **kwargs: calls.append(kwargs),
+    )
+    model = SpatialSAXSAdaptiveSamplingTaskManager.fit_gp(
+        torch.rand(4, 2, dtype=torch.double),
+        torch.rand(4, 2, dtype=torch.double),
+        n_task_covar_ranks=1,
+        max_fit_gp_mll_iterations=7,
+    )
+
+    assert model.covar_module.task_covar_module.covar_factor.shape == (2, 1)
+    assert calls == [{"optimizer_kwargs": {"options": {"maxiter": 7}}}]
+
+    SpatialSAXSAdaptiveSamplingTaskManager.fit_gp(
+        torch.rand(4, 2, dtype=torch.double),
+        torch.rand(4, 2, dtype=torch.double),
+        n_task_covar_ranks=1,
+        max_fit_gp_mll_iterations=None,
+    )
+
+    assert calls[-1] == {}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"n_task_covar_ranks": 0}, "`n_task_covar_ranks`"),
+        ({"n_task_covar_ranks": 3}, "`n_task_covar_ranks`"),
+        ({"max_fit_gp_mll_iterations": 0}, "`max_fit_gp_mll_iterations`"),
+    ],
+)
+def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        configure_manager(make_manager(), **kwargs)
 
 
 def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():

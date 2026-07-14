@@ -13,6 +13,7 @@ dependencies = [
     "eaa-imaging",
     "gpytorch",
     "h5py",
+    "scikit-learn",
     "torch",
 ]
 

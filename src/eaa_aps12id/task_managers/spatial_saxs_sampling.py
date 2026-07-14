@@ -12,6 +12,7 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.models import KroneckerMultiTaskGP
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
+from sklearn.decomposition import NMF, SparsePCA
 
 from eaa_core.api.llm_config import LLMConfig
 from eaa_core.api.memory import MemoryManagerConfig
@@ -47,7 +48,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     """Adaptive sampler for spatially resolved SAXS.
 
     The workflow measures spectra on a finite spatial mesh, preprocesses each
-    ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, learns a PCA latent
+    ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, learns a latent
     representation, and uses a joint multi-output GP acquisition function to
     choose additional measurement positions.
     """
@@ -103,7 +104,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.epsilon_intensity: float | None = None
         self.num_initial_samples: int | None = None
         self.max_measurements: int | None = None
-        self.num_pca_components: int | None = None
+        self.num_components: int | None = None
+        self.dimension_reduction_method: str | None = None
+        self.n_task_covar_ranks: int | None = None
+        self.max_fit_gp_mll_iterations: int | None = None
         self.lambda_logdet: float | None = None
         self.num_mc_samples: int | None = None
         self.w_d: float | None = None
@@ -165,7 +169,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_intensity: float = 1e-12,
         num_initial_samples: int = 5,
         max_measurements: int = 20,
-        num_pca_components: int = 2,
+        num_components: int = 2,
+        dimension_reduction_method: str = "pca",
+        n_task_covar_ranks: int | None = None,
+        max_fit_gp_mll_iterations: int | None = None,
         lambda_logdet: float = 1e-6,
         num_mc_samples: int = 64,
         w_d: float = 1.0,
@@ -187,7 +194,16 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "epsilon_intensity": float(epsilon_intensity),
             "num_initial_samples": int(num_initial_samples),
             "max_measurements": int(max_measurements),
-            "num_pca_components": int(num_pca_components),
+            "num_components": int(num_components),
+            "dimension_reduction_method": dimension_reduction_method,
+            "n_task_covar_ranks": (
+                None if n_task_covar_ranks is None else int(n_task_covar_ranks)
+            ),
+            "max_fit_gp_mll_iterations": (
+                None
+                if max_fit_gp_mll_iterations is None
+                else int(max_fit_gp_mll_iterations)
+            ),
             "lambda_logdet": float(lambda_logdet),
             "num_mc_samples": int(num_mc_samples),
             "w_d": float(w_d),
@@ -217,7 +233,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.epsilon_intensity = config["epsilon_intensity"]
         self.num_initial_samples = config["num_initial_samples"]
         self.max_measurements = config["max_measurements"]
-        self.num_pca_components = config["num_pca_components"]
+        self.num_components = config["num_components"]
+        self.dimension_reduction_method = config["dimension_reduction_method"]
+        self.n_task_covar_ranks = config["n_task_covar_ranks"]
+        self.max_fit_gp_mll_iterations = config["max_fit_gp_mll_iterations"]
         self.lambda_logdet = config["lambda_logdet"]
         self.num_mc_samples = config["num_mc_samples"]
         self.w_d = config["w_d"]
@@ -257,12 +276,31 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`max_measurements` cannot exceed the number of candidate positions."
             )
-        if self.num_pca_components < 1:
-            raise ValueError("`num_pca_components` must be positive.")
-        if self.num_pca_components >= self.num_initial_samples:
+        if self.num_components < 1:
+            raise ValueError("`num_components` must be positive.")
+        if self.num_components >= self.num_initial_samples:
             raise ValueError(
-                "`num_pca_components` must be smaller than `num_initial_samples` "
-                "for initial PCA fitting."
+                "`num_components` must be smaller than `num_initial_samples` "
+                "for initial dimensionality reduction fitting."
+            )
+        if self.dimension_reduction_method not in {"pca", "sparse_pca", "nmf"}:
+            raise ValueError(
+                "`dimension_reduction_method` must be one of "
+                "'pca', 'sparse_pca', or 'nmf'."
+            )
+        if self.n_task_covar_ranks is not None and not (
+            1 <= self.n_task_covar_ranks <= self.num_components
+        ):
+            raise ValueError(
+                "`n_task_covar_ranks` must be between 1 and `num_components`, "
+                "or None for full rank."
+            )
+        if (
+            self.max_fit_gp_mll_iterations is not None
+            and self.max_fit_gp_mll_iterations < 1
+        ):
+            raise ValueError(
+                "`max_fit_gp_mll_iterations` must be positive or None."
             )
         if self.lambda_logdet <= 0:
             raise ValueError("`lambda_logdet` must be positive.")
@@ -298,7 +336,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_intensity: float = 1e-12,
         num_initial_samples: int = 5,
         max_measurements: int = 20,
-        num_pca_components: int = 2,
+        num_components: int = 2,
+        dimension_reduction_method: str = "pca",
+        n_task_covar_ranks: int | None = None,
+        max_fit_gp_mll_iterations: int | None = None,
         lambda_logdet: float = 1e-6,
         num_mc_samples: int = 64,
         w_d: float = 1.0,
@@ -333,8 +374,15 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_measurements : int
             Total measurement budget, including initial measurements, denoted
             ``N_max``.
-        num_pca_components : int
-            Number of retained PCA latent components, denoted ``N_pcs``.
+        num_components : int
+            Number of retained dimensionality reduction components.
+        dimension_reduction_method : {"pca", "sparse_pca", "nmf"}
+            Dimensionality reduction method used to obtain latent scores.
+        n_task_covar_ranks : int, optional
+            Rank of the GP task covariance. When omitted, use full rank.
+        max_fit_gp_mll_iterations : int, optional
+            Maximum optimizer iterations for GP marginal likelihood fitting.
+            When omitted, do not impose an iteration limit.
         lambda_logdet : float
             Regularization added to the latent scatter matrix.
         num_mc_samples : int
@@ -371,7 +419,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             epsilon_intensity=epsilon_intensity,
             num_initial_samples=num_initial_samples,
             max_measurements=max_measurements,
-            num_pca_components=num_pca_components,
+            num_components=num_components,
+            dimension_reduction_method=dimension_reduction_method,
+            n_task_covar_ranks=n_task_covar_ranks,
+            max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
             lambda_logdet=lambda_logdet,
             num_mc_samples=num_mc_samples,
             w_d=w_d,
@@ -563,7 +614,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return np.log(interpolated + self.epsilon_intensity)
 
     def refit_model(self) -> None:
-        """Refit PCA, latent standardization, and the joint multi-output GP."""
+        """Refit dimensionality reduction and the joint multi-output GP."""
         self._require_sampling_configured()
         fitting_indices = [
             index
@@ -571,7 +622,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             if index not in self.excluded_measurement_indices
         ]
         self._record_progress_message(
-            f"Updating PCA and Gaussian process model with {len(fitting_indices)} "
+            "Updating dimensionality reduction and Gaussian process model with "
+            f"{len(fitting_indices)} "
             "measurements."
         )
         try:
@@ -604,14 +656,19 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         measurement_indices: list[int],
         fit_mll: bool,
     ) -> tuple[torch.Tensor, Any]:
-        """Fit PCA and a GP using the selected measurements."""
+        """Fit dimensionality reduction and a GP using selected measurements."""
         spectra = torch.as_tensor(
             np.vstack(
                 [self.measurements[index].spectrum for index in measurement_indices]
             ),
             dtype=torch.double,
         )
-        latent_scores = self.fit_pca(spectra, self.num_pca_components)
+        latent_scores = self.fit_dimensionality_reduction(
+            spectra,
+            self.num_components,
+            self.dimension_reduction_method,
+            random_seed=self.random_seed,
+        )
         standardized_latent_scores = self.standardize_latent_scores(
             latent_scores, self.epsilon_z
         )
@@ -629,7 +686,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         gp_model = self.fit_gp(
             train_x,
             standardized_latent_scores,
-            self.num_pca_components,
+            n_task_covar_ranks=self.n_task_covar_ranks,
+            max_fit_gp_mll_iterations=self.max_fit_gp_mll_iterations,
             fit_mll=fit_mll,
         )
         return standardized_latent_scores, gp_model
@@ -871,7 +929,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
     @staticmethod
     def fit_pca(
-        spectra: "torch.Tensor", num_pca_components: int
+        spectra: "torch.Tensor", num_components: int
     ) -> "torch.Tensor":
         """Fit PCA and project the spectra into its latent space.
 
@@ -879,39 +937,94 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ----------
         spectra : torch.Tensor
             Preprocessed spectra with shape ``(N, N_q)``.
-        num_pca_components : int
+        num_components : int
             Number of principal components to retain.
 
         Returns
         -------
         torch.Tensor
-            PCA projections with shape ``(N, num_pca_components)``.
+            PCA projections with shape ``(N, num_components)``.
         """
-        if spectra.shape[0] <= num_pca_components:
+        if spectra.shape[0] <= num_components:
             raise ValueError("Need more measured spectra than PCA components.")
         pca_mean = spectra.mean(dim=0)
         centered = spectra - pca_mean
         _, _, vh = torch.linalg.svd(centered, full_matrices=False)
-        pca_components = vh[:num_pca_components]
+        pca_components = vh[:num_components]
         return centered @ pca_components.T
+
+    @staticmethod
+    def fit_dimensionality_reduction(
+        spectra: "torch.Tensor",
+        num_components: int,
+        dimension_reduction_method: str,
+        random_seed: int | None = None,
+    ) -> "torch.Tensor":
+        """Fit a dimensionality reduction model and return latent scores.
+
+        Parameters
+        ----------
+        spectra : torch.Tensor
+            Preprocessed spectra with shape ``(N, N_q)``.
+        num_components : int
+            Number of latent components to retain.
+        dimension_reduction_method : {"pca", "sparse_pca", "nmf"}
+            Dimensionality reduction method.
+        random_seed : int, optional
+            Random seed passed to scikit-learn estimators.
+
+        Returns
+        -------
+        torch.Tensor
+            Latent scores with shape ``(N, num_components)``.
+        """
+        if dimension_reduction_method == "pca":
+            latent_scores =  SpatialSAXSAdaptiveSamplingTaskManager.fit_pca(
+                spectra, num_components
+            )
+            return latent_scores
+
+        spectra_array = spectra.detach().cpu().numpy()
+        if dimension_reduction_method == "sparse_pca":
+            latent_scores = SparsePCA(
+                n_components=num_components,
+                random_state=random_seed,
+            ).fit_transform(spectra_array)
+        elif dimension_reduction_method == "nmf":
+            nonnegative_spectra = spectra_array - spectra_array.min()
+            latent_scores = NMF(
+                n_components=num_components,
+                init="nndsvd",
+                random_state=random_seed,
+            ).fit_transform(nonnegative_spectra)
+        else:
+            raise ValueError(
+                "`dimension_reduction_method` must be one of "
+                "'pca', 'sparse_pca', or 'nmf'."
+            )
+        return torch.as_tensor(
+            latent_scores,
+            dtype=spectra.dtype,
+            device=spectra.device,
+        )
 
     @staticmethod
     def standardize_latent_scores(
         latent_scores: "torch.Tensor", epsilon_z: float
     ) -> "torch.Tensor":
-        """Standardize PCA scores dimension-wise for GP training.
+        """Standardize latent scores dimension-wise for GP training.
 
         Parameters
         ----------
         latent_scores : torch.Tensor
-            PCA projections with shape ``(N, N_pcs)``.
+            Latent projections with shape ``(N, num_components)``.
         epsilon_z : float
             Stabilizing value added to each latent standard deviation.
 
         Returns
         -------
         torch.Tensor
-            Standardized PCA projections with the same shape as ``latent_scores``.
+            Standardized projections with the same shape as ``latent_scores``.
         """
         latent_mean = latent_scores.mean(dim=0)
         latent_std = latent_scores.std(dim=0, unbiased=True)
@@ -921,7 +1034,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     def fit_gp(
         train_x: "torch.Tensor",
         train_y: "torch.Tensor",
-        num_pca_components: int,
+        n_task_covar_ranks: int | None = None,
+        max_fit_gp_mll_iterations: int | None = None,
         fit_mll: bool = True,
     ) -> Any:
         """Fit the joint multi-output GP in normalized position space.
@@ -931,9 +1045,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         train_x : torch.Tensor
             Normalized measured positions with shape ``(N, 2)``.
         train_y : torch.Tensor
-            Standardized PCA projections with shape ``(N, N_pcs)``.
-        num_pca_components : int
-            Number of modeled PCA components.
+            Standardized latent projections with shape ``(N, num_components)``.
+        n_task_covar_ranks : int, optional
+            Rank of the task covariance. When omitted, use full rank.
+        max_fit_gp_mll_iterations : int, optional
+            Maximum marginal likelihood optimizer iterations. When omitted,
+            do not impose an iteration limit.
         fit_mll : bool
             Whether to optimize the marginal log likelihood.
 
@@ -949,12 +1066,21 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             train_X=train_x,
             train_Y=train_y.double(),
             data_covar_module=data_kernel,
-            rank=num_pca_components,
+            rank=n_task_covar_ranks,
             outcome_transform=None,
         )
+
         if fit_mll:
             mll = ExactMarginalLogLikelihood(gp_model.likelihood, gp_model)
-            fit_gpytorch_mll(mll)
+            if max_fit_gp_mll_iterations is None:
+                fit_gpytorch_mll(mll)
+            else:
+                fit_gpytorch_mll(
+                    mll,
+                    optimizer_kwargs={
+                        "options": {"maxiter": max_fit_gp_mll_iterations}
+                    },
+                )
         gp_model.eval()
         return gp_model
 
@@ -1036,7 +1162,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         x = candidate_x.clone().detach().requires_grad_(True)
         mean = self.gp_model.posterior(x).mean
         gradients = []
-        for latent_idx in range(self.num_pca_components):
+        for latent_idx in range(self.num_components):
             grad = torch.autograd.grad(
                 mean[:, latent_idx].sum(),
                 x,
@@ -1065,9 +1191,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ----------
         current : torch.Tensor
             Current standardized latent vectors with shape
-            ``(N_past, N_pcs)``.
+            ``(N_past, num_components)``.
         candidates : torch.Tensor
-            Candidate latent vectors with shape ``(..., N_pcs)``.
+            Candidate latent vectors with shape ``(..., num_components)``.
 
         Returns
         -------
@@ -1082,12 +1208,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         centered = current - current_mean
         scatter = centered.T @ centered
         eye = torch.eye(
-            self.num_pca_components, dtype=current.dtype, device=current.device
+            self.num_components, dtype=current.dtype, device=current.device
         )
         base = self.lambda_logdet * eye + scatter
         chol = torch.linalg.cholesky(base)
         diff = candidates - current_mean
-        flat_diff = diff.reshape(-1, self.num_pca_components)
+        flat_diff = diff.reshape(-1, self.num_components)
         solved = torch.cholesky_solve(flat_diff.T, chol).T
         mahalanobis = (flat_diff * solved).sum(dim=-1)
         factor = num_past / (num_past + 1)

@@ -631,6 +631,7 @@ dependencies = [
     { name = "eaa-imaging" },
     { name = "gpytorch" },
     { name = "h5py" },
+    { name = "scikit-learn" },
     { name = "torch" },
 ]
 
@@ -641,6 +642,7 @@ requires-dist = [
     { name = "eaa-imaging", git = "https://github.com/AdvancedPhotonSource/EAA.git?subdirectory=packages%2Feaa-imaging&branch=main" },
     { name = "gpytorch" },
     { name = "h5py" },
+    { name = "scikit-learn" },
     { name = "torch", index = "https://download.pytorch.org/whl/cu129" },
 ]
 
