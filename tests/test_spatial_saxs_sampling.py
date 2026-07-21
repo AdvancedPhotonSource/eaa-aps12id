@@ -205,7 +205,6 @@ def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
     def fake_fit_gp(
         train_x,
         train_y,
-        n_task_covar_ranks=None,
         max_fit_gp_mll_iterations=None,
         fit_mll=True,
     ):
@@ -232,7 +231,9 @@ def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
     assert manager.excluded_measurement_indices == {3}
 
 
-def test_fit_gp_configures_task_rank_and_mll_iterations(monkeypatch):
+def test_fit_gp_creates_independent_component_models_and_configures_iterations(
+    monkeypatch,
+):
     import torch
 
     calls = []
@@ -243,28 +244,29 @@ def test_fit_gp_configures_task_rank_and_mll_iterations(monkeypatch):
     model = SpatialSAXSAdaptiveSamplingTaskManager.fit_gp(
         torch.rand(4, 2, dtype=torch.double),
         torch.rand(4, 2, dtype=torch.double),
-        n_task_covar_ranks=1,
         max_fit_gp_mll_iterations=7,
     )
 
-    assert model.covar_module.task_covar_module.covar_factor.shape == (2, 1)
-    assert calls == [{"optimizer_kwargs": {"options": {"maxiter": 7}}}]
+    assert len(model.models) == 2
+    assert model.models[0].covar_module is not model.models[1].covar_module
+    assert model.models[0].covar_module.base_kernel.ard_num_dims == 2
+    assert calls == [
+        {"optimizer_kwargs": {"options": {"maxiter": 7}}},
+        {"optimizer_kwargs": {"options": {"maxiter": 7}}},
+    ]
 
     SpatialSAXSAdaptiveSamplingTaskManager.fit_gp(
         torch.rand(4, 2, dtype=torch.double),
         torch.rand(4, 2, dtype=torch.double),
-        n_task_covar_ranks=1,
         max_fit_gp_mll_iterations=None,
     )
 
-    assert calls[-1] == {}
+    assert calls[-2:] == [{}, {}]
 
 
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"n_task_covar_ranks": 0}, "`n_task_covar_ranks`"),
-        ({"n_task_covar_ranks": 3}, "`n_task_covar_ranks`"),
         ({"max_fit_gp_mll_iterations": 0}, "`max_fit_gp_mll_iterations`"),
     ],
 )

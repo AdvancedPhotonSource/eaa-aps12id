@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from botorch.fit import fit_gpytorch_mll
-from botorch.models import KroneckerMultiTaskGP
+from botorch.models import ModelListGP, SingleTaskGP
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from sklearn.decomposition import NMF, SparsePCA
@@ -49,8 +49,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
     The workflow measures spectra on a finite spatial mesh, preprocesses each
     ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, learns a latent
-    representation, and uses a joint multi-output GP acquisition function to
-    choose additional measurement positions.
+    representation, and uses independent GP models for the latent components
+    to choose additional measurement positions.
     """
 
     def __init__(
@@ -106,7 +106,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.max_measurements: int | None = None
         self.num_components: int | None = None
         self.dimension_reduction_method: str | None = None
-        self.n_task_covar_ranks: int | None = None
         self.max_fit_gp_mll_iterations: int | None = None
         self.lambda_logdet: float | None = None
         self.num_mc_samples: int | None = None
@@ -171,7 +170,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_measurements: int = 20,
         num_components: int = 2,
         dimension_reduction_method: str = "pca",
-        n_task_covar_ranks: int | None = None,
         max_fit_gp_mll_iterations: int | None = None,
         lambda_logdet: float = 1e-6,
         num_mc_samples: int = 64,
@@ -196,9 +194,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "max_measurements": int(max_measurements),
             "num_components": int(num_components),
             "dimension_reduction_method": dimension_reduction_method,
-            "n_task_covar_ranks": (
-                None if n_task_covar_ranks is None else int(n_task_covar_ranks)
-            ),
             "max_fit_gp_mll_iterations": (
                 None
                 if max_fit_gp_mll_iterations is None
@@ -235,7 +230,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.max_measurements = config["max_measurements"]
         self.num_components = config["num_components"]
         self.dimension_reduction_method = config["dimension_reduction_method"]
-        self.n_task_covar_ranks = config["n_task_covar_ranks"]
         self.max_fit_gp_mll_iterations = config["max_fit_gp_mll_iterations"]
         self.lambda_logdet = config["lambda_logdet"]
         self.num_mc_samples = config["num_mc_samples"]
@@ -288,13 +282,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 "`dimension_reduction_method` must be one of "
                 "'pca', 'sparse_pca', or 'nmf'."
             )
-        if self.n_task_covar_ranks is not None and not (
-            1 <= self.n_task_covar_ranks <= self.num_components
-        ):
-            raise ValueError(
-                "`n_task_covar_ranks` must be between 1 and `num_components`, "
-                "or None for full rank."
-            )
         if (
             self.max_fit_gp_mll_iterations is not None
             and self.max_fit_gp_mll_iterations < 1
@@ -338,7 +325,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_measurements: int = 20,
         num_components: int = 2,
         dimension_reduction_method: str = "pca",
-        n_task_covar_ranks: int | None = None,
         max_fit_gp_mll_iterations: int | None = None,
         lambda_logdet: float = 1e-6,
         num_mc_samples: int = 64,
@@ -378,8 +364,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Number of retained dimensionality reduction components.
         dimension_reduction_method : {"pca", "sparse_pca", "nmf"}
             Dimensionality reduction method used to obtain latent scores.
-        n_task_covar_ranks : int, optional
-            Rank of the GP task covariance. When omitted, use full rank.
         max_fit_gp_mll_iterations : int, optional
             Maximum optimizer iterations for GP marginal likelihood fitting.
             When omitted, do not impose an iteration limit.
@@ -421,7 +405,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             max_measurements=max_measurements,
             num_components=num_components,
             dimension_reduction_method=dimension_reduction_method,
-            n_task_covar_ranks=n_task_covar_ranks,
             max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
             lambda_logdet=lambda_logdet,
             num_mc_samples=num_mc_samples,
@@ -614,7 +597,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return np.log(interpolated + self.epsilon_intensity)
 
     def refit_model(self) -> None:
-        """Refit dimensionality reduction and the joint multi-output GP."""
+        """Refit dimensionality reduction and the independent GP models."""
         self._require_sampling_configured()
         fitting_indices = [
             index
@@ -686,7 +669,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         gp_model = self.fit_gp(
             train_x,
             standardized_latent_scores,
-            n_task_covar_ranks=self.n_task_covar_ranks,
             max_fit_gp_mll_iterations=self.max_fit_gp_mll_iterations,
             fit_mll=fit_mll,
         )
@@ -1034,11 +1016,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     def fit_gp(
         train_x: "torch.Tensor",
         train_y: "torch.Tensor",
-        n_task_covar_ranks: int | None = None,
         max_fit_gp_mll_iterations: int | None = None,
         fit_mll: bool = True,
     ) -> Any:
-        """Fit the joint multi-output GP in normalized position space.
+        """Fit independent GPs for latent components in normalized position space.
 
         Parameters
         ----------
@@ -1046,8 +1027,6 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Normalized measured positions with shape ``(N, 2)``.
         train_y : torch.Tensor
             Standardized latent projections with shape ``(N, num_components)``.
-        n_task_covar_ranks : int, optional
-            Rank of the task covariance. When omitted, use full rank.
         max_fit_gp_mll_iterations : int, optional
             Maximum marginal likelihood optimizer iterations. When omitted,
             do not impose an iteration limit.
@@ -1056,31 +1035,36 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
         Returns
         -------
-        KroneckerMultiTaskGP
-            Fitted multi-output Gaussian process model.
+        ModelListGP
+            Fitted collection of independent Gaussian process models.
         """
-        data_kernel = ScaleKernel(
-            MaternKernel(nu=2.5, ard_num_dims=2),
-        )
-        gp_model = KroneckerMultiTaskGP(
-            train_X=train_x,
-            train_Y=train_y.double(),
-            data_covar_module=data_kernel,
-            rank=n_task_covar_ranks,
-            outcome_transform=None,
-        )
-
-        if fit_mll:
-            mll = ExactMarginalLogLikelihood(gp_model.likelihood, gp_model)
-            if max_fit_gp_mll_iterations is None:
-                fit_gpytorch_mll(mll)
-            else:
-                fit_gpytorch_mll(
-                    mll,
-                    optimizer_kwargs={
-                        "options": {"maxiter": max_fit_gp_mll_iterations}
-                    },
+        component_models = []
+        for component_index in range(train_y.shape[-1]):
+            component_model = SingleTaskGP(
+                train_X=train_x,
+                train_Y=train_y[:, component_index : component_index + 1].double(),
+                covar_module=ScaleKernel(
+                    MaternKernel(nu=2.5, ard_num_dims=2),
+                ),
+                outcome_transform=None,
+            )
+            if fit_mll:
+                mll = ExactMarginalLogLikelihood(
+                    component_model.likelihood,
+                    component_model,
                 )
+                if max_fit_gp_mll_iterations is None:
+                    fit_gpytorch_mll(mll)
+                else:
+                    fit_gpytorch_mll(
+                        mll,
+                        optimizer_kwargs={
+                            "options": {"maxiter": max_fit_gp_mll_iterations}
+                        },
+                    )
+            component_models.append(component_model)
+
+        gp_model = ModelListGP(*component_models)
         gp_model.eval()
         return gp_model
 
