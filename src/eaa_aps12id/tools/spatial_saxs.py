@@ -17,14 +17,19 @@ class _LinearNDExtrapolator:
     """Use linear scattered interpolation with RBF extrapolation."""
 
     def __init__(self, points: np.ndarray, values: np.ndarray) -> None:
+        if np.any(values <= 0):
+            raise ValueError(
+                "Measured SAXS intensities must be strictly positive for "
+                "log-intensity extrapolation."
+            )
         self.linear_interpolator = LinearNDInterpolator(
             points,
             values,
             fill_value=np.nan,
         )
-        self.rbf_extrapolator = RBFInterpolator(
+        self.log_rbf_extrapolator = RBFInterpolator(
             points,
-            values,
+            np.log(values),
             kernel="linear",
             degree=1,
         )
@@ -37,7 +42,8 @@ class _LinearNDExtrapolator:
         values = np.asarray(self.linear_interpolator(flat_points), dtype=float)
         outside = np.isnan(values).all(axis=1)
         if np.any(outside):
-            values[outside] = self.rbf_extrapolator(flat_points[outside])
+            log_intensity = self.log_rbf_extrapolator(flat_points[outside])
+            values[outside] = np.exp(log_intensity)
         return values.reshape(*original_shape, values.shape[-1])
 
 

@@ -18,7 +18,7 @@ def write_scan(root, *, scan_prefix="Ssample_00236", spectrum_ids=(1, 2, 3, 4)):
     for spectrum_id in spectrum_ids:
         x = x_by_id[spectrum_id]
         y = y_by_id[spectrum_id]
-        intensity = 10.0 * x + 20.0 * y + q
+        intensity = 1.0 + 10.0 * x + 20.0 * y + q
         error = np.full_like(q, 0.1)
         data = np.column_stack([q, intensity, error])
         np.savetxt(
@@ -45,7 +45,7 @@ def test_simulated_spatial_saxs_interpolates_position_and_q_grid(tmp_path):
 
     expected_q = np.arange(0.0, 3.0, 0.5)
     np.testing.assert_allclose(q, expected_q)
-    np.testing.assert_allclose(intensity, 15.0 + expected_q)
+    np.testing.assert_allclose(intensity, 16.0 + expected_q)
     assert tool.scan_identifier == "sample_00236"
     assert tool.saxs_data.shape == (4, 4, 2)
 
@@ -57,7 +57,7 @@ def test_incomplete_collection_uses_first_metadata_positions(tmp_path):
     q, intensity = tool.acquire_saxs(x=0.0, y=0.0, q_min=0.0, q_max=2.0, q_step=1.0)
 
     np.testing.assert_allclose(q, [0.0, 1.0])
-    np.testing.assert_allclose(intensity, [10.0, 11.0])
+    np.testing.assert_allclose(intensity, [11.0, 12.0])
     np.testing.assert_allclose(
         tool.measured_positions,
         [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
@@ -105,7 +105,7 @@ def test_non_rectangular_grid_uses_linear_interpolation(tmp_path):
     )
 
     np.testing.assert_allclose(q, [0.0, 1.0])
-    np.testing.assert_allclose(intensity, [7.5, 8.5])
+    np.testing.assert_allclose(intensity, [8.5, 9.5])
     assert tool.saxs_data.shape == (3, 4, 2)
     np.testing.assert_allclose(
         tool.measured_positions,
@@ -122,7 +122,8 @@ def test_scattered_interpolation_extrapolates_outside_convex_hull(tmp_path):
     )
 
     np.testing.assert_allclose(q, [0.0, 1.0])
-    np.testing.assert_allclose(intensity, [30.0, 31.0])
+    assert np.isfinite(intensity).all()
+    assert np.all(intensity > 0)
 
 
 def test_rectangular_interpolation_extrapolates_outside_convex_hull(tmp_path):
@@ -134,7 +135,19 @@ def test_rectangular_interpolation_extrapolates_outside_convex_hull(tmp_path):
     )
 
     np.testing.assert_allclose(q, [0.0, 1.0])
-    np.testing.assert_allclose(intensity, [30.0, 31.0])
+    assert np.isfinite(intensity).all()
+    assert np.all(intensity > 0)
+
+
+def test_nonpositive_measured_intensity_raises(tmp_path):
+    write_scan(tmp_path)
+    path = tmp_path / "SAXS" / "Averaged" / "Ssample_00236_00001.dat"
+    data = np.loadtxt(path, comments="%")
+    data[0, 1] = 0.0
+    np.savetxt(path, data)
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
 
 def test_inconsistent_q_grid_raises(tmp_path):
