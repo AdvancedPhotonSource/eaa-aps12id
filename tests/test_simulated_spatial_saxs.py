@@ -113,26 +113,28 @@ def test_non_rectangular_grid_uses_linear_interpolation(tmp_path):
     )
 
 
-def test_scattered_interpolation_returns_nan_outside_convex_hull(tmp_path):
+def test_scattered_interpolation_extrapolates_outside_convex_hull(tmp_path):
     write_scan(tmp_path, spectrum_ids=(1, 2, 3))
     tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    _, intensity = tool.acquire_saxs(
+    q, intensity = tool.acquire_saxs(
         x=1.0, y=1.0, q_min=0.0, q_max=2.0, q_step=1.0
     )
 
-    assert np.isnan(intensity).all()
+    np.testing.assert_allclose(q, [0.0, 1.0])
+    np.testing.assert_allclose(intensity, [30.0, 31.0])
 
 
-def test_rectangular_interpolation_returns_nan_outside_convex_hull(tmp_path):
+def test_rectangular_interpolation_extrapolates_outside_convex_hull(tmp_path):
     write_scan(tmp_path)
     tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    _, intensity = tool.acquire_saxs(
+    q, intensity = tool.acquire_saxs(
         x=2.0, y=0.5, q_min=0.0, q_max=2.0, q_step=1.0
     )
 
-    assert np.isnan(intensity).all()
+    np.testing.assert_allclose(q, [0.0, 1.0])
+    np.testing.assert_allclose(intensity, [30.0, 31.0])
 
 
 def test_inconsistent_q_grid_raises(tmp_path):

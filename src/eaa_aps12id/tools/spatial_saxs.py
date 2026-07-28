@@ -7,10 +7,38 @@ from typing import Annotated
 
 import h5py
 import numpy as np
-from scipy.interpolate import LinearNDInterpolator
+from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
 
 from eaa_core.tool.base import BaseTool, check, tool
 from eaa_aps12id.data_parser import SAXSDataParser
+
+
+class _LinearNDExtrapolator:
+    """Use linear scattered interpolation with RBF extrapolation."""
+
+    def __init__(self, points: np.ndarray, values: np.ndarray) -> None:
+        self.linear_interpolator = LinearNDInterpolator(
+            points,
+            values,
+            fill_value=np.nan,
+        )
+        self.rbf_extrapolator = RBFInterpolator(
+            points,
+            values,
+            kernel="linear",
+            degree=1,
+        )
+
+    def __call__(self, points: np.ndarray) -> np.ndarray:
+        """Interpolate or extrapolate values at spatial points."""
+        points = np.asarray(points, dtype=float)
+        original_shape = points.shape[:-1]
+        flat_points = points.reshape(-1, points.shape[-1])
+        values = np.asarray(self.linear_interpolator(flat_points), dtype=float)
+        outside = np.isnan(values).all(axis=1)
+        if np.any(outside):
+            values[outside] = self.rbf_extrapolator(flat_points[outside])
+        return values.reshape(*original_shape, values.shape[-1])
 
 
 class SimulatedSpatialSAXS(BaseTool):
@@ -51,7 +79,7 @@ class SimulatedSpatialSAXS(BaseTool):
         self.measured_positions: np.ndarray | None = None
         self.q_values: np.ndarray | None = None
         self.saxs_data: np.ndarray | None = None
-        self.interpolator: LinearNDInterpolator | None = None
+        self.interpolator: _LinearNDExtrapolator | None = None
         self.parser = SAXSDataParser()
         super().__init__(*args, require_approval=require_approval, **kwargs)
 
@@ -199,10 +227,9 @@ class SimulatedSpatialSAXS(BaseTool):
         q = np.stack([record[2] for record in records])
         intensity = np.stack([record[3] for record in records])
         self.saxs_data = np.stack((q, intensity), axis=-1)
-        self.interpolator = LinearNDInterpolator(
+        self.interpolator = _LinearNDExtrapolator(
             self.measured_positions[:, [1, 0]],
             intensity,
-            fill_value=np.nan,
         )
 
     @tool(name="simulated_spatial_saxs.acquire_saxs")
