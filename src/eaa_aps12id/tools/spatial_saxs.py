@@ -7,7 +7,7 @@ from typing import Annotated
 
 import h5py
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import LinearNDInterpolator
 
 from eaa_core.tool.base import BaseTool, check, tool
 from eaa_aps12id.data_parser import SAXSDataParser
@@ -48,10 +48,10 @@ class SimulatedSpatialSAXS(BaseTool):
         self.scan_identifier: str | None = None
         self.x_values: np.ndarray | None = None
         self.y_values: np.ndarray | None = None
+        self.measured_positions: np.ndarray | None = None
         self.q_values: np.ndarray | None = None
         self.saxs_data: np.ndarray | None = None
-        self.intensity_grid: np.ndarray | None = None
-        self.interpolator: RegularGridInterpolator | None = None
+        self.interpolator: LinearNDInterpolator | None = None
         self.parser = SAXSDataParser()
         super().__init__(*args, require_approval=require_approval, **kwargs)
 
@@ -100,7 +100,7 @@ class SimulatedSpatialSAXS(BaseTool):
             spectra_by_id[spectrum_id] = self.parser.parse(dat_file)
 
         x_positions, y_positions = self._load_positions(metadata_identifier)
-        self._build_grid(spectra_by_id, x_positions, y_positions)
+        self._build_interpolator(spectra_by_id, x_positions, y_positions)
 
     def _parse_dat_filename(self, dat_file: Path) -> tuple[str, str, int]:
         match = self._FILENAME_PATTERN.match(dat_file.name)
@@ -133,20 +133,37 @@ class SimulatedSpatialSAXS(BaseTool):
             raise ValueError("`motor_sth` and `motor_sav` must have matching lengths.")
         return x_positions, y_positions
 
-    def _build_grid(
+    def _build_interpolator(
         self,
         spectra_by_id: dict[int, np.ndarray],
         x_positions: np.ndarray,
         y_positions: np.ndarray,
     ) -> None:
+        if len(spectra_by_id) > x_positions.size:
+            raise ValueError(
+                f"Found {len(spectra_by_id)} spectra but metadata has only "
+                f"{x_positions.size} positions."
+            )
+
+        sorted_spectra = sorted(spectra_by_id.items())
+        if len(sorted_spectra) < x_positions.size:
+            positioned_spectra = [
+                (row_index, spectrum)
+                for row_index, (_, spectrum) in enumerate(sorted_spectra)
+            ]
+        else:
+            positioned_spectra = [
+                (spectrum_id - 1, spectrum)
+                for spectrum_id, spectrum in sorted_spectra
+            ]
+
         first_q: np.ndarray | None = None
         records: list[tuple[float, float, np.ndarray, np.ndarray]] = []
-        for spectrum_id, spectrum in sorted(spectra_by_id.items()):
-            row_index = spectrum_id - 1
+        for row_index, spectrum in positioned_spectra:
             if row_index >= x_positions.size:
                 raise ValueError(
-                    f"Spectrum ID {spectrum_id:05d} maps to row {row_index}, "
-                    f"but metadata has only {x_positions.size} rows."
+                    f"Spectrum maps to row {row_index}, but metadata has only "
+                    f"{x_positions.size} rows."
                 )
             q = np.asarray(spectrum[:, 0], dtype=float)
             intensity = np.asarray(spectrum[:, 1], dtype=float)
@@ -172,38 +189,20 @@ class SimulatedSpatialSAXS(BaseTool):
 
         self.x_values = np.array(sorted({record[0] for record in records}), dtype=float)
         self.y_values = np.array(sorted({record[1] for record in records}), dtype=float)
-        expected_count = self.x_values.size * self.y_values.size
-        if len(records) != expected_count:
-            raise ValueError(
-                "SAXS positions must form a complete rectangular grid; "
-                f"expected {expected_count} spectra, got {len(records)}."
-            )
-
-        x_index = {value: idx for idx, value in enumerate(self.x_values)}
-        y_index = {value: idx for idx, value in enumerate(self.y_values)}
-        n_q = first_q.size
-        self.saxs_data = np.empty((self.y_values.size, self.x_values.size, n_q, 2))
-        self.intensity_grid = np.empty((self.y_values.size, self.x_values.size, n_q))
-        populated: set[tuple[int, int]] = set()
-
-        for x, y, q, intensity in records:
-            grid_index = (y_index[y], x_index[x])
-            if grid_index in populated:
-                raise ValueError(f"Duplicate SAXS position at x={x}, y={y}.")
-            populated.add(grid_index)
-            self.saxs_data[grid_index[0], grid_index[1], :, 0] = q
-            self.saxs_data[grid_index[0], grid_index[1], :, 1] = intensity
-            self.intensity_grid[grid_index[0], grid_index[1], :] = intensity
-
-        if len(populated) != expected_count:
-            raise ValueError("SAXS positions must cover every rectangular grid point.")
+        self.measured_positions = np.array(
+            [(record[0], record[1]) for record in records], dtype=float
+        )
+        if np.unique(self.measured_positions, axis=0).shape[0] != len(records):
+            raise ValueError("SAXS positions must not contain duplicates.")
 
         self.q_values = first_q.copy()
-        self.interpolator = RegularGridInterpolator(
-            (self.y_values, self.x_values),
-            self.intensity_grid,
-            bounds_error=False,
-            fill_value=None,
+        q = np.stack([record[2] for record in records])
+        intensity = np.stack([record[3] for record in records])
+        self.saxs_data = np.stack((q, intensity), axis=-1)
+        self.interpolator = LinearNDInterpolator(
+            self.measured_positions[:, [1, 0]],
+            intensity,
+            fill_value=np.nan,
         )
 
     @tool(name="simulated_spatial_saxs.acquire_saxs")

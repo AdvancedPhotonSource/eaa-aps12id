@@ -47,19 +47,21 @@ def test_simulated_spatial_saxs_interpolates_position_and_q_grid(tmp_path):
     np.testing.assert_allclose(q, expected_q)
     np.testing.assert_allclose(intensity, 15.0 + expected_q)
     assert tool.scan_identifier == "sample_00236"
-    assert tool.saxs_data.shape == (2, 2, 4, 2)
+    assert tool.saxs_data.shape == (4, 4, 2)
 
 
-def test_spectrum_id_maps_to_one_based_metadata_row(tmp_path):
-    write_scan(tmp_path, spectrum_ids=(2,))
-    tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_00002.dat")
+def test_incomplete_collection_uses_first_metadata_positions(tmp_path):
+    write_scan(tmp_path, spectrum_ids=(2, 3, 4))
+    tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    q, intensity = tool.acquire_saxs(x=1.0, y=0.0, q_min=0.0, q_max=2.0, q_step=1.0)
+    q, intensity = tool.acquire_saxs(x=0.0, y=0.0, q_min=0.0, q_max=2.0, q_step=1.0)
 
     np.testing.assert_allclose(q, [0.0, 1.0])
     np.testing.assert_allclose(intensity, [10.0, 11.0])
-    np.testing.assert_allclose(tool.x_values, [1.0])
-    np.testing.assert_allclose(tool.y_values, [0.0])
+    np.testing.assert_allclose(
+        tool.measured_positions,
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+    )
 
 
 def test_missing_dat_files_raise(tmp_path):
@@ -94,21 +96,43 @@ def test_zero_spectrum_id_raises(tmp_path):
         SimulatedSpatialSAXS(tmp_path, "Ssample_00236_00000.dat")
 
 
-def test_incomplete_grid_raises(tmp_path):
+def test_non_rectangular_grid_uses_linear_interpolation(tmp_path):
     write_scan(tmp_path, spectrum_ids=(1, 2, 3))
+    tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    with pytest.raises(ValueError, match="complete rectangular grid"):
-        SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
+    q, intensity = tool.acquire_saxs(
+        x=0.25, y=0.25, q_min=0.0, q_max=2.0, q_step=1.0
+    )
+
+    np.testing.assert_allclose(q, [0.0, 1.0])
+    np.testing.assert_allclose(intensity, [7.5, 8.5])
+    assert tool.saxs_data.shape == (3, 4, 2)
+    np.testing.assert_allclose(
+        tool.measured_positions,
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+    )
 
 
-def test_out_of_bounds_position_extrapolates(tmp_path):
+def test_scattered_interpolation_returns_nan_outside_convex_hull(tmp_path):
+    write_scan(tmp_path, spectrum_ids=(1, 2, 3))
+    tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
+
+    _, intensity = tool.acquire_saxs(
+        x=1.0, y=1.0, q_min=0.0, q_max=2.0, q_step=1.0
+    )
+
+    assert np.isnan(intensity).all()
+
+
+def test_rectangular_interpolation_returns_nan_outside_convex_hull(tmp_path):
     write_scan(tmp_path)
     tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    q, intensity = tool.acquire_saxs(x=2.0, y=0.5, q_min=0.0, q_max=2.0, q_step=1.0)
+    _, intensity = tool.acquire_saxs(
+        x=2.0, y=0.5, q_min=0.0, q_max=2.0, q_step=1.0
+    )
 
-    np.testing.assert_allclose(q, [0.0, 1.0])
-    np.testing.assert_allclose(intensity, [30.0, 31.0])
+    assert np.isnan(intensity).all()
 
 
 def test_inconsistent_q_grid_raises(tmp_path):
