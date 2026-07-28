@@ -294,12 +294,18 @@ def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
             return Posterior()
 
     manager.gp_model = GPModel()
-    manager.compute_latent_gradient_magnitude = lambda candidate_x: torch.ones(9)
-    manager.compute_expected_logdet_diversity = lambda posterior: torch.ones(9)
+    manager.compute_latent_gradient_magnitude = lambda candidate_x: pytest.fail(
+        "gradient calculation should be skipped"
+    )
+    manager.compute_expected_logdet_diversity = lambda posterior: pytest.fail(
+        "diversity calculation should be skipped"
+    )
 
     scores = manager.compute_acquisition_scores()
 
     assert manager.epsilon_acquisition == 1e-3
+    np.testing.assert_array_equal(scores.gradient_tilde, np.zeros(9))
+    np.testing.assert_array_equal(scores.q_div_tilde, np.zeros(9))
     np.testing.assert_allclose(
         scores.acquisition,
         manager.epsilon_acquisition * scores.sigma_tilde,

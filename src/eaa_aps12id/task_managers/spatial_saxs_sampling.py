@@ -1118,12 +1118,22 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         mean = posterior.mean
         variance = posterior.variance.clamp_min(0.0)
         sigma = torch.sqrt(variance.mean(dim=-1))
-        gradient = self.compute_latent_gradient_magnitude(candidate_x)
-        q_div = self.compute_expected_logdet_diversity(posterior)
 
         sigma_tilde = self.normalize_tensor(sigma)
-        gradient_tilde = self.normalize_tensor(gradient)
-        q_div_tilde = self.normalize_tensor(q_div)
+        gradient_tilde = (
+            torch.zeros_like(sigma)
+            if self.w_g == 0
+            else self.normalize_tensor(
+                self.compute_latent_gradient_magnitude(candidate_x)
+            )
+        )
+        q_div_tilde = (
+            torch.zeros_like(sigma)
+            if self.w_d == 0
+            else self.normalize_tensor(
+                self.compute_expected_logdet_diversity(posterior)
+            )
+        )
         acquisition = sigma_tilde * (
             self.w_d * q_div_tilde
             + self.w_g * gradient_tilde
