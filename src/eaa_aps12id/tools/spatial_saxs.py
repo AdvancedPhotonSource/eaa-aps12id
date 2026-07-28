@@ -7,9 +7,9 @@ from typing import Annotated
 
 import h5py
 import numpy as np
+from eaa_core.tool.base import BaseTool, check, tool
 from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
 
-from eaa_core.tool.base import BaseTool, check, tool
 from eaa_aps12id.data_parser import SAXSDataParser
 
 
@@ -128,13 +128,18 @@ class SimulatedSpatialSAXS(BaseTool):
         metadata_identifier = next(iter(metadata_ids))
 
         spectra_by_id: dict[int, np.ndarray] = {}
+        spectrum_stems_by_id: dict[int, str] = {}
         for _, _, spectrum_id, dat_file in parsed_files:
             if spectrum_id in spectra_by_id:
                 raise ValueError(f"Duplicate spectrum ID {spectrum_id:05d}.")
             spectra_by_id[spectrum_id] = self.parser.parse(dat_file)
+            spectrum_stems_by_id[spectrum_id] = dat_file.stem
 
-        x_positions, y_positions = self._load_positions(metadata_identifier)
-        self._build_interpolator(spectra_by_id, x_positions, y_positions)
+        positions_by_id = self._load_positions(
+            metadata_identifier,
+            spectrum_stems_by_id,
+        )
+        self._build_interpolator(spectra_by_id, positions_by_id)
 
     def _parse_dat_filename(self, dat_file: Path) -> tuple[str, str, int]:
         match = self._FILENAME_PATTERN.match(dat_file.name)
@@ -153,8 +158,12 @@ class SimulatedSpatialSAXS(BaseTool):
         scan_identifier = f"{metadata_identifier}_{match.group('scan_id')}"
         return metadata_identifier, scan_identifier, int(match.group("spectrum_id"))
 
-    def _load_positions(self, scan_identifier: str) -> tuple[np.ndarray, np.ndarray]:
-        metadata_path = self.data_root / "Metadata" / f"{scan_identifier}.h5"
+    def _load_positions(
+        self,
+        metadata_identifier: str,
+        spectrum_stems_by_id: dict[int, str],
+    ) -> dict[int, tuple[float, float]]:
+        metadata_path = self.data_root / "Metadata" / f"{metadata_identifier}.h5"
         if not metadata_path.exists():
             raise FileNotFoundError(f"Metadata file does not exist: {metadata_path}")
 
@@ -162,53 +171,60 @@ class SimulatedSpatialSAXS(BaseTool):
             measurement = h5_file["entry"]["measurement"]
             x_positions = np.asarray(measurement["motor_sth"], dtype=float).reshape(-1)
             y_positions = np.asarray(measurement["motor_sav"], dtype=float).reshape(-1)
+            saxs_filenames = np.asarray(measurement["saxs_filename"]).reshape(-1)
 
-        if x_positions.shape != y_positions.shape:
-            raise ValueError("`motor_sth` and `motor_sav` must have matching lengths.")
-        return x_positions, y_positions
+        if not (
+            x_positions.shape == y_positions.shape == saxs_filenames.shape
+        ):
+            raise ValueError(
+                "`motor_sth`, `motor_sav`, and `saxs_filename` must have "
+                "matching lengths."
+            )
+
+        positions_by_stem: dict[str, tuple[float, float]] = {}
+        for x, y, filename in zip(
+            x_positions,
+            y_positions,
+            saxs_filenames,
+            strict=True,
+        ):
+            if isinstance(filename, bytes):
+                filename = filename.decode()
+            stem = Path(str(filename)).stem
+            if stem in positions_by_stem:
+                raise ValueError(f"Duplicate SAXS filename in metadata: {stem!r}.")
+            positions_by_stem[stem] = (float(x), float(y))
+
+        positions_by_id = {}
+        for spectrum_id, stem in spectrum_stems_by_id.items():
+            if stem not in positions_by_stem:
+                raise ValueError(
+                    f"No metadata row matched SAXS file {stem + '.dat'!r}."
+                )
+            positions_by_id[spectrum_id] = positions_by_stem[stem]
+        return positions_by_id
 
     def _build_interpolator(
         self,
         spectra_by_id: dict[int, np.ndarray],
-        x_positions: np.ndarray,
-        y_positions: np.ndarray,
+        positions_by_id: dict[int, tuple[float, float]],
     ) -> None:
-        if len(spectra_by_id) > x_positions.size:
-            raise ValueError(
-                f"Found {len(spectra_by_id)} spectra but metadata has only "
-                f"{x_positions.size} positions."
-            )
-
         sorted_spectra = sorted(spectra_by_id.items())
-        if len(sorted_spectra) < x_positions.size:
-            positioned_spectra = [
-                (row_index, spectrum)
-                for row_index, (_, spectrum) in enumerate(sorted_spectra)
-            ]
-        else:
-            positioned_spectra = [
-                (spectrum_id - 1, spectrum)
-                for spectrum_id, spectrum in sorted_spectra
-            ]
 
         first_q: np.ndarray | None = None
         records: list[tuple[float, float, np.ndarray, np.ndarray]] = []
-        for row_index, spectrum in positioned_spectra:
-            if row_index >= x_positions.size:
-                raise ValueError(
-                    f"Spectrum maps to row {row_index}, but metadata has only "
-                    f"{x_positions.size} rows."
-                )
+        for spectrum_id, spectrum in sorted_spectra:
             q = np.asarray(spectrum[:, 0], dtype=float)
             intensity = np.asarray(spectrum[:, 1], dtype=float)
             if first_q is None:
                 first_q = q
             elif q.shape != first_q.shape or not np.allclose(q, first_q):
                 raise ValueError("All SAXS spectra must share the same q grid.")
+            x, y = positions_by_id[spectrum_id]
             records.append(
                 (
-                    float(x_positions[row_index]),
-                    float(y_positions[row_index]),
+                    x,
+                    y,
                     q,
                     intensity,
                 )

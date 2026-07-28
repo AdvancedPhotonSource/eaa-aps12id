@@ -33,6 +33,16 @@ def write_scan(root, *, scan_prefix="Ssample_00236", spectrum_ids=(1, 2, 3, 4)):
         measurement = h5_file.create_group("entry").create_group("measurement")
         measurement.create_dataset("motor_sth", data=[0.0, 1.0, 0.0, 1.0])
         measurement.create_dataset("motor_sav", data=[0.0, 0.0, 1.0, 1.0])
+        measurement.create_dataset(
+            "saxs_filename",
+            data=np.asarray(
+                [
+                    f"{scan_prefix}_{spectrum_id:05d}.h5"
+                    for spectrum_id in (1, 2, 3, 4)
+                ],
+                dtype="S",
+            ),
+        )
 
     return q
 
@@ -50,17 +60,56 @@ def test_simulated_spatial_saxs_interpolates_position_and_q_grid(tmp_path):
     assert tool.saxs_data.shape == (4, 4, 2)
 
 
-def test_incomplete_collection_uses_first_metadata_positions(tmp_path):
+def test_incomplete_collection_uses_filename_matched_positions(tmp_path):
     write_scan(tmp_path, spectrum_ids=(2, 3, 4))
     tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
 
-    q, intensity = tool.acquire_saxs(x=0.0, y=0.0, q_min=0.0, q_max=2.0, q_step=1.0)
+    q, intensity = tool.acquire_saxs(x=1.0, y=0.0, q_min=0.0, q_max=2.0, q_step=1.0)
 
     np.testing.assert_allclose(q, [0.0, 1.0])
     np.testing.assert_allclose(intensity, [11.0, 12.0])
     np.testing.assert_allclose(
         tool.measured_positions,
-        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+    )
+
+
+def test_positions_are_matched_to_filenames_with_multiple_scans(tmp_path):
+    write_scan(tmp_path)
+    metadata_path = tmp_path / "Metadata" / "sample.h5"
+    with h5py.File(metadata_path, "r+") as h5_file:
+        measurement = h5_file["entry"]["measurement"]
+        del measurement["motor_sth"]
+        del measurement["motor_sav"]
+        del measurement["saxs_filename"]
+        measurement.create_dataset(
+            "motor_sth",
+            data=[10.0, 11.0, 0.0, 1.0, 0.0, 1.0],
+        )
+        measurement.create_dataset(
+            "motor_sav",
+            data=[10.0, 10.0, 0.0, 0.0, 1.0, 1.0],
+        )
+        measurement.create_dataset(
+            "saxs_filename",
+            data=np.asarray(
+                [
+                    "Ssample_00100_00001.h5",
+                    "Ssample_00100_00002.h5",
+                    "Ssample_00236_00001.h5",
+                    "Ssample_00236_00002.h5",
+                    "Ssample_00236_00003.h5",
+                    "Ssample_00236_00004.h5",
+                ],
+                dtype="S",
+            ),
+        )
+
+    tool = SimulatedSpatialSAXS(tmp_path, "Ssample_00236_*.dat")
+
+    np.testing.assert_allclose(
+        tool.measured_positions,
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
     )
 
 
