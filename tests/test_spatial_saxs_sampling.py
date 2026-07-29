@@ -280,6 +280,31 @@ def test_predicted_peak_areas_undo_standardization():
     np.testing.assert_allclose(areas.detach().cpu().numpy()[0], expected)
 
 
+def test_predicted_peak_area_acquisition_uses_pointwise_maximum(monkeypatch):
+    manager = configure_manager(make_manager())
+
+    import torch
+
+    predicted_areas = torch.tensor(
+        [[1.0, 4.0, 2.0], [3.0, 2.0, 1.0]],
+        dtype=torch.double,
+    )
+    monkeypatch.setattr(
+        manager,
+        "compute_predicted_peak_areas",
+        lambda standardized_mean: predicted_areas,
+    )
+
+    maximum = manager.compute_predicted_max_peak_area(
+        torch.zeros_like(predicted_areas)
+    )
+
+    np.testing.assert_array_equal(
+        maximum.detach().cpu().numpy(),
+        np.array([4.0, 3.0]),
+    )
+
+
 def test_new_peak_evicts_dictionary_entry_with_smallest_maximum_area(monkeypatch):
     manager = configure_manager(
         make_manager(),
@@ -524,7 +549,7 @@ def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
     manager.compute_peak_gradient_magnitude = lambda candidate_x: pytest.fail(
         "gradient calculation should be skipped"
     )
-    manager.compute_predicted_total_peak_area = lambda mean: pytest.fail(
+    manager.compute_predicted_max_peak_area = lambda mean: pytest.fail(
         "peak-area calculation should be skipped"
     )
 

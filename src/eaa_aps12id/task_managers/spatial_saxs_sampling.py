@@ -579,7 +579,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Maximum optimizer iterations for GP marginal likelihood fitting.
             When omitted, do not impose an iteration limit.
         w_peak : float
-            Predicted integrated-peak-area acquisition weight.
+            Maximum predicted integrated-peak-area acquisition weight.
         w_g : float
             Spatial-gradient acquisition weight.
         epsilon_acquisition : float
@@ -1421,7 +1421,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         panels: list[tuple[str, np.ndarray, np.ndarray | None]] = [
             ("Posterior uncertainty", self.candidate_positions, uncertainty),
             (
-                "Predicted total peak area",
+                "Normalized maximum peak area",
                 scores.positions if scores is not None else self.candidate_positions,
                 scores.peak_area_tilde if scores is not None else None,
             ),
@@ -1716,7 +1716,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             torch.zeros_like(sigma)
             if self.w_peak == 0
             else self.normalize_tensor(
-                self.compute_predicted_total_peak_area(mean)
+                self.compute_predicted_max_peak_area(mean)
             )
         )
         acquisition = sigma_tilde * (
@@ -1756,12 +1756,14 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             * torch.expm1(transformed_mean)
         ).clamp_min(0.0)
 
-    def compute_predicted_total_peak_area(
+    def compute_predicted_max_peak_area(
         self,
         standardized_mean: "torch.Tensor",
     ) -> "torch.Tensor":
-        """Return the sum of predicted physical integrated peak areas."""
-        return self.compute_predicted_peak_areas(standardized_mean).sum(dim=-1)
+        """Return the maximum predicted physical peak area at each position."""
+        return self.compute_predicted_peak_areas(
+            standardized_mean
+        ).max(dim=-1).values
 
     def compute_peak_gradient_magnitude(
         self,
