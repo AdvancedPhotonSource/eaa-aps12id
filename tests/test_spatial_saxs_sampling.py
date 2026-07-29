@@ -120,6 +120,25 @@ def test_initial_sobol_selection_is_unique_and_deterministic():
     assert len(set(indices_a)) == manager_a.num_initial_samples
 
 
+def test_initial_selection_respects_exclusion_radius():
+    manager = configure_manager(
+        make_manager(),
+        exclusion_radius=1.01,
+    )
+
+    indices = manager.get_initial_candidate_indices()
+    positions = manager.candidate_positions[indices]
+    pairwise_distances = np.linalg.norm(
+        positions[:, None, :] - positions[None, :, :],
+        axis=-1,
+    )
+
+    assert np.all(
+        pairwise_distances[np.triu_indices(len(indices), k=1)]
+        >= manager.exclusion_radius
+    )
+
+
 def test_arpls_background_is_not_pulled_to_narrow_peak():
     x = np.linspace(0.0, 1.0, 200)
     background = 1.0 + 0.2 * x
@@ -536,6 +555,74 @@ def test_scheduled_exploration_selects_farthest_unsampled_position():
     )
 
 
+def test_exclusion_radius_filters_adaptive_suggestions():
+    manager = configure_manager(
+        make_manager(),
+        exclusion_radius=1.01,
+        w_peak=0.0,
+        w_g=0.0,
+    )
+    manager.measurements = [SimpleNamespace()]
+    manager.measured_candidate_indices = [4]
+
+    import torch
+
+    class GPModel:
+        @staticmethod
+        def posterior(candidate_x):
+            count = candidate_x.shape[0]
+            return SimpleNamespace(
+                mean=torch.zeros(count, 1, dtype=torch.double),
+                variance=torch.arange(
+                    1,
+                    count + 1,
+                    dtype=torch.double,
+                ).unsqueeze(-1),
+            )
+
+    manager.gp_model = GPModel()
+
+    scores = manager.compute_acquisition_scores()
+    suggestion = manager.suggest_next_positions()
+
+    expected_positions = np.array(
+        [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [2.0, 2.0],
+        ]
+    )
+    np.testing.assert_array_equal(scores.positions, expected_positions)
+    assert np.linalg.norm(suggestion[0] - np.array([1.0, 1.0])) >= 1.01
+
+
+def test_exclusion_radius_excludes_candidate_on_boundary():
+    manager = configure_manager(
+        make_manager(),
+        exclusion_radius=1.0,
+    )
+    manager.measured_candidate_indices = [4]
+
+    eligible = manager.get_eligible_candidate_indices()
+
+    np.testing.assert_array_equal(
+        eligible,
+        np.array([0, 2, 6, 8]),
+    )
+
+
+def test_exclusion_radius_reports_when_no_candidate_is_eligible():
+    manager = configure_manager(
+        make_manager(),
+        exclusion_radius=10.0,
+    )
+    manager.measured_candidate_indices = [4]
+
+    with pytest.raises(ValueError, match="No eligible candidate"):
+        manager.get_farthest_unsampled_position()
+
+
 def test_normalize_tensor_clips_to_configured_percentiles():
     manager = configure_manager(
         make_manager(),
@@ -652,6 +739,11 @@ def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
 def test_configure_rejects_invalid_peak_observable():
     with pytest.raises(ValueError, match="`peak_observable`"):
         configure_manager(make_manager(), peak_observable="prominence")
+
+
+def test_configure_rejects_negative_exclusion_radius():
+    with pytest.raises(ValueError, match="`exclusion_radius`"):
+        configure_manager(make_manager(), exclusion_radius=-0.1)
 
 
 def test_configure_rejects_negative_new_peak_relative_area():

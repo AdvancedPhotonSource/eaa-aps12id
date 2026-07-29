@@ -142,6 +142,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.epsilon_intensity: float | None = None
         self.num_initial_samples: int | None = None
         self.max_measurements: int | None = None
+        self.exclusion_radius: float | None = None
         self.background_smoothness: float | None = None
         self.background_max_iterations: int | None = None
         self.background_tolerance: float | None = None
@@ -228,6 +229,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_intensity: float = 1e-12,
         num_initial_samples: int = 5,
         max_measurements: int = 20,
+        exclusion_radius: float | None = None,
         background_smoothness: float = 1e6,
         background_max_iterations: int = 50,
         background_tolerance: float = 1e-3,
@@ -268,6 +270,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "epsilon_intensity": float(epsilon_intensity),
             "num_initial_samples": int(num_initial_samples),
             "max_measurements": int(max_measurements),
+            "exclusion_radius": (
+                None
+                if exclusion_radius is None
+                else float(exclusion_radius)
+            ),
             "background_smoothness": float(background_smoothness),
             "background_max_iterations": int(background_max_iterations),
             "background_tolerance": float(background_tolerance),
@@ -340,6 +347,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.epsilon_intensity = config["epsilon_intensity"]
         self.num_initial_samples = config["num_initial_samples"]
         self.max_measurements = config["max_measurements"]
+        self.exclusion_radius = config["exclusion_radius"]
         self.background_smoothness = config["background_smoothness"]
         self.background_max_iterations = config["background_max_iterations"]
         self.background_tolerance = config["background_tolerance"]
@@ -409,6 +417,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         if self.max_measurements > self.candidate_positions.shape[0]:
             raise ValueError(
                 "`max_measurements` cannot exceed the number of candidate positions."
+            )
+        if self.exclusion_radius is not None and (
+            not np.isfinite(self.exclusion_radius)
+            or self.exclusion_radius < 0
+        ):
+            raise ValueError(
+                "`exclusion_radius` must be finite and nonnegative or None."
             )
         if self.background_smoothness <= 0:
             raise ValueError("`background_smoothness` must be positive.")
@@ -512,6 +527,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_intensity: float = 1e-12,
         num_initial_samples: int = 5,
         max_measurements: int = 20,
+        exclusion_radius: float | None = None,
         background_smoothness: float = 1e6,
         background_max_iterations: int = 50,
         background_tolerance: float = 1e-3,
@@ -565,6 +581,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_measurements : int
             Total measurement budget, including initial measurements, denoted
             ``N_max``.
+        exclusion_radius : float, optional
+            Radius around each previously measured position, in physical
+            ``(x, y)`` coordinates, in which new positions are excluded.
+            Candidates on the radius boundary are also excluded. When
+            omitted, only previously measured positions are excluded.
         background_smoothness : float
             arPLS baseline smoothness penalty.
         background_max_iterations : int
@@ -648,6 +669,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             epsilon_intensity=epsilon_intensity,
             num_initial_samples=num_initial_samples,
             max_measurements=max_measurements,
+            exclusion_radius=exclusion_radius,
             background_smoothness=background_smoothness,
             background_max_iterations=background_max_iterations,
             background_tolerance=background_tolerance,
@@ -762,7 +784,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             nearest = torch.argmin(distances, dim=1).detach().cpu().numpy()
             for idx in nearest:
                 idx_int = int(idx)
-                if idx_int not in selected_set:
+                eligible = self._filter_candidate_indices_by_exclusion(
+                    np.asarray([idx_int], dtype=int),
+                    [*self.measured_candidate_indices, *selected],
+                )
+                if idx_int not in selected_set and eligible.size:
                     selected.append(idx_int)
                     selected_set.add(idx_int)
                     if len(selected) == self.num_initial_samples:
@@ -770,11 +796,20 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             max_draws *= 2
 
         for idx in range(self.candidate_positions.shape[0]):
-            if idx not in selected_set:
+            eligible = self._filter_candidate_indices_by_exclusion(
+                np.asarray([idx], dtype=int),
+                [*self.measured_candidate_indices, *selected],
+            )
+            if idx not in selected_set and eligible.size:
                 selected.append(idx)
                 selected_set.add(idx)
                 if len(selected) == self.num_initial_samples:
                     break
+        if len(selected) < self.num_initial_samples:
+            raise ValueError(
+                "`exclusion_radius` leaves fewer than `num_initial_samples` "
+                "eligible candidate positions."
+            )
         return selected
 
     def measure_candidate(
@@ -1727,8 +1762,33 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             dtype=int,
         )
 
+    def _filter_candidate_indices_by_exclusion(
+        self,
+        candidate_indices: np.ndarray,
+        reference_indices: list[int],
+    ) -> np.ndarray:
+        """Remove candidates inside the exclusion radius of references."""
+        candidate_indices = np.asarray(candidate_indices, dtype=int)
+        if self.exclusion_radius is None or not reference_indices:
+            return candidate_indices
+        candidate_positions = self.candidate_positions[candidate_indices]
+        reference_positions = self.candidate_positions[reference_indices]
+        minimum_distances = np.linalg.norm(
+            candidate_positions[:, None, :]
+            - reference_positions[None, :, :],
+            axis=-1,
+        ).min(axis=1)
+        return candidate_indices[minimum_distances > self.exclusion_radius]
+
+    def get_eligible_candidate_indices(self) -> np.ndarray:
+        """Return unsampled candidates outside measured-point exclusions."""
+        return self._filter_candidate_indices_by_exclusion(
+            self.get_unsampled_candidate_indices(),
+            self.measured_candidate_indices,
+        )
+
     def suggest_next_positions(self, k: int = 1) -> np.ndarray:
-        """Return the current top-k unsampled candidate positions."""
+        """Return the current top-k eligible candidate positions."""
         self._require_sampling_configured()
         if k < 1:
             raise ValueError("`k` must be positive.")
@@ -1741,7 +1801,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             return self.get_farthest_unsampled_position()[None, :]
         scores = self.compute_acquisition_scores()
         if k > scores.positions.shape[0]:
-            raise ValueError("`k` cannot exceed the number of unsampled candidates.")
+            raise ValueError("`k` cannot exceed the number of eligible candidates.")
         order = np.argsort(-scores.acquisition, kind="stable")
         return scores.positions[order[:k]].copy()
 
@@ -1756,32 +1816,32 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return (adaptive_measurements + 1) % self.exploration_interval == 0
 
     def get_farthest_unsampled_position(self) -> np.ndarray:
-        """Return the unsampled position farthest from all measured positions."""
-        unsampled_indices = self.get_unsampled_candidate_indices()
-        if unsampled_indices.size == 0:
-            raise ValueError("No unsampled candidate positions remain.")
+        """Return the eligible position farthest from all measured positions."""
+        eligible_indices = self.get_eligible_candidate_indices()
+        if eligible_indices.size == 0:
+            raise ValueError("No eligible candidate positions remain.")
         if not self.measured_candidate_indices:
-            return self.candidate_positions[unsampled_indices[0]].copy()
-        unsampled = self.candidate_positions_normalized[unsampled_indices]
+            return self.candidate_positions[eligible_indices[0]].copy()
+        eligible = self.candidate_positions_normalized[eligible_indices]
         measured = self.candidate_positions_normalized[
             self.measured_candidate_indices
         ]
         minimum_distances = np.linalg.norm(
-            unsampled[:, None, :] - measured[None, :, :],
+            eligible[:, None, :] - measured[None, :, :],
             axis=-1,
         ).min(axis=1)
         return self.candidate_positions[
-            unsampled_indices[int(np.argmax(minimum_distances))]
+            eligible_indices[int(np.argmax(minimum_distances))]
         ].copy()
 
     def compute_acquisition_scores(self) -> AcquisitionScores:
         """Compute acquisition scores over all unsampled candidates."""
         self._require_sampling_configured()
-        unsampled_indices = self.get_unsampled_candidate_indices()
-        if unsampled_indices.size == 0:
-            raise ValueError("No unsampled candidate positions remain.")
+        eligible_indices = self.get_eligible_candidate_indices()
+        if eligible_indices.size == 0:
+            raise ValueError("No eligible candidate positions remain.")
         candidate_x = torch.as_tensor(
-            self.candidate_positions_normalized[unsampled_indices],
+            self.candidate_positions_normalized[eligible_indices],
             dtype=torch.double,
         )
         if self.w_peak == 0:
@@ -1796,14 +1856,14 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
             posterior = self.gp_model.posterior(full_candidate_x)
             full_mean = posterior.mean
-            unsampled_tensor_indices = torch.as_tensor(
-                unsampled_indices,
+            eligible_tensor_indices = torch.as_tensor(
+                eligible_indices,
                 dtype=torch.long,
                 device=full_mean.device,
             )
-            mean = full_mean[unsampled_tensor_indices]
+            mean = full_mean[eligible_tensor_indices]
             variance = posterior.variance[
-                unsampled_tensor_indices
+                eligible_tensor_indices
             ].clamp_min(0.0)
             full_peak_observable_tilde = (
                 self.compute_concentration_gated_peak_score(full_mean)
@@ -1821,7 +1881,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         peak_observable_tilde = (
             torch.zeros_like(sigma)
             if self.w_peak == 0
-            else full_peak_observable_tilde[unsampled_tensor_indices]
+            else full_peak_observable_tilde[eligible_tensor_indices]
         )
         acquisition = sigma_tilde * (
             self.w_peak * peak_observable_tilde
@@ -1829,7 +1889,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             + self.epsilon_acquisition
         )
         scores = AcquisitionScores(
-            positions=self.candidate_positions[unsampled_indices].copy(),
+            positions=self.candidate_positions[eligible_indices].copy(),
             acquisition=acquisition.detach().cpu().numpy(),
             sigma_tilde=sigma_tilde.detach().cpu().numpy(),
             peak_area_tilde=peak_observable_tilde.detach().cpu().numpy(),
