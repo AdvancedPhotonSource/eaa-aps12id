@@ -156,6 +156,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.peak_window_width_factor: float | None = None
         self.num_initial_peaks: int | None = None
         self.max_peaks_in_dict: int | None = None
+        self.known_peak_q_values: np.ndarray | None = None
         self.new_peak_min_relative_area: float | None = None
         self.peak_map_min_concentration: float | None = None
         self.peak_observable: str | None = None
@@ -243,6 +244,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         peak_window_width_factor: float = 2.0,
         num_initial_peaks: int = 5,
         max_peaks_in_dict: int = 10,
+        known_peak_q_values: (
+            np.ndarray | list[float] | tuple[float, ...] | None
+        ) = None,
         new_peak_min_relative_area: float = 0.001,
         peak_map_min_concentration: float = 0.15,
         peak_observable: Literal["height", "area"] = "area",
@@ -261,6 +265,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         """Configure sampling parameters for one adaptive run."""
         x_axis = self._validate_axis_values(x_values, "x_values")
         y_axis = self._validate_axis_values(y_values, "y_values")
+        known_peaks = (
+            None
+            if known_peak_q_values is None
+            else np.asarray(known_peak_q_values, dtype=float).reshape(-1)
+        )
         config = {
             "x_values": tuple(x_axis.tolist()),
             "y_values": tuple(y_axis.tolist()),
@@ -296,6 +305,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "peak_window_width_factor": float(peak_window_width_factor),
             "num_initial_peaks": int(num_initial_peaks),
             "max_peaks_in_dict": int(max_peaks_in_dict),
+            "known_peak_q_values": (
+                None
+                if known_peaks is None
+                else tuple(known_peaks.tolist())
+            ),
             "new_peak_min_relative_area": float(
                 new_peak_min_relative_area
             ),
@@ -365,6 +379,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.peak_window_width_factor = config["peak_window_width_factor"]
         self.num_initial_peaks = config["num_initial_peaks"]
         self.max_peaks_in_dict = config["max_peaks_in_dict"]
+        self.known_peak_q_values = (
+            None
+            if known_peaks is None
+            else known_peaks.copy()
+        )
         self.new_peak_min_relative_area = config[
             "new_peak_min_relative_area"
         ]
@@ -462,6 +481,31 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`max_peaks_in_dict` must be at least `num_initial_peaks`."
             )
+        if self.known_peak_q_values is not None:
+            if self.known_peak_q_values.size == 0:
+                raise ValueError(
+                    "`known_peak_q_values` must contain at least one value."
+                )
+            if (
+                not np.all(np.isfinite(self.known_peak_q_values))
+                or np.any(self.known_peak_q_values <= 0)
+            ):
+                raise ValueError(
+                    "`known_peak_q_values` must contain finite positive values."
+                )
+            if np.unique(self.known_peak_q_values).size != (
+                self.known_peak_q_values.size
+            ):
+                raise ValueError(
+                    "`known_peak_q_values` must not contain duplicates."
+                )
+            if np.any(
+                (self.known_peak_q_values < self.q_min)
+                | (self.known_peak_q_values > self.q_max)
+            ):
+                raise ValueError(
+                    "`known_peak_q_values` must lie within `[q_min, q_max]`."
+                )
         if self.new_peak_min_relative_area < 0:
             raise ValueError(
                 "`new_peak_min_relative_area` must be nonnegative."
@@ -541,6 +585,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         peak_window_width_factor: float = 2.0,
         num_initial_peaks: int = 5,
         max_peaks_in_dict: int = 10,
+        known_peak_q_values: (
+            np.ndarray | list[float] | tuple[float, ...] | None
+        ) = None,
         new_peak_min_relative_area: float = 0.001,
         peak_map_min_concentration: float = 0.2,
         peak_observable: Literal["height", "area"] = "area",
@@ -615,6 +662,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Maximum number of peaks admitted after initial measurements.
         max_peaks_in_dict : int
             Maximum number of active peak entries and GP models.
+        known_peak_q_values : array-like, optional
+            Authoritative peak q positions. When provided, the peak dictionary
+            contains exactly these peaks and dynamic peak discovery is
+            disabled.
         new_peak_min_relative_area : float
             Minimum discovery-area ratio relative to the strongest active
             peak's historical maximum area for dynamic dictionary admission.
@@ -687,6 +738,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             peak_window_width_factor=peak_window_width_factor,
             num_initial_peaks=num_initial_peaks,
             max_peaks_in_dict=max_peaks_in_dict,
+            known_peak_q_values=known_peak_q_values,
             new_peak_min_relative_area=new_peak_min_relative_area,
             peak_map_min_concentration=peak_map_min_concentration,
             peak_observable=peak_observable,
@@ -1224,8 +1276,94 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             discovery_measurement_index=discovery_measurement_index,
         )
 
+    @staticmethod
+    def _match_known_peak(
+        q_position: float,
+        detected_peaks: list[DetectedSAXSPeak],
+    ) -> DetectedSAXSPeak | None:
+        """Return the closest detected peak whose FWHM contains a known q."""
+        log_q_position = float(np.log(q_position))
+        matches = [
+            peak
+            for peak in detected_peaks
+            if abs(log_q_position - peak.log_q_position)
+            <= 0.5 * peak.width_log_q
+        ]
+        if not matches:
+            return None
+        return min(
+            matches,
+            key=lambda peak: (
+                abs(log_q_position - peak.log_q_position),
+                -peak.integrated_area,
+            ),
+        )
+
+    def _initialize_known_peak_dictionary(self) -> None:
+        """Create exactly one dictionary entry for each known peak q."""
+        detections = [
+            self.detect_peaks(measurement.spectrum)
+            for measurement in self.measurements
+        ]
+        self.peak_dict = {}
+        for peak_id, q_position in enumerate(self.known_peak_q_values):
+            candidates = [
+                (matched_peak, measurement_index)
+                for measurement_index, detected_peaks in enumerate(detections)
+                if (
+                    matched_peak := self._match_known_peak(
+                        float(q_position),
+                        detected_peaks,
+                    )
+                )
+                is not None
+            ]
+            if candidates:
+                matched_peak, discovery_index = min(
+                    candidates,
+                    key=lambda item: (
+                        abs(
+                            np.log(q_position)
+                            - item[0].log_q_position
+                        ),
+                        -item[0].integrated_area,
+                    ),
+                )
+                q_left = matched_peak.q_left
+                q_right = matched_peak.q_right
+                width_log_q = matched_peak.width_log_q
+                max_integrated_area = max(
+                    self.integrate_peak_area(
+                        measurement.spectrum,
+                        q_left,
+                        q_right,
+                    )
+                    for measurement in self.measurements
+                )
+            else:
+                discovery_index = -1
+                q_left = float(q_position)
+                q_right = float(q_position)
+                width_log_q = 0.0
+                max_integrated_area = 0.0
+            self.peak_dict[peak_id] = SAXSPeak(
+                peak_id=peak_id,
+                q_position=float(q_position),
+                log_q_position=float(np.log(q_position)),
+                q_left=q_left,
+                q_right=q_right,
+                width_log_q=width_log_q,
+                max_integrated_area=max_integrated_area,
+                discovery_measurement_index=discovery_index,
+            )
+        self._next_peak_id = len(self.peak_dict)
+        self._peak_detection_measurement_count = len(self.measurements)
+
     def _initialize_peak_dictionary(self) -> None:
         """Build the initial dictionary from all initial spectra."""
+        if self.known_peak_q_values is not None:
+            self._initialize_known_peak_dictionary()
+            return
         candidates = []
         for measurement_index, measurement in enumerate(self.measurements):
             candidates.extend(
@@ -1252,6 +1390,43 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         """Update peak areas and admit new peaks from unprocessed measurements."""
         if not self.peak_dict:
             self._initialize_peak_dictionary()
+            return
+        if self.known_peak_q_values is not None:
+            for measurement_index in range(
+                self._peak_detection_measurement_count,
+                len(self.measurements),
+            ):
+                measurement = self.measurements[measurement_index]
+                detected_peaks = self.detect_peaks(measurement.spectrum)
+                for peak in self.peak_dict.values():
+                    if peak.width_log_q == 0:
+                        matched_peak = self._match_known_peak(
+                            peak.q_position,
+                            detected_peaks,
+                        )
+                        if matched_peak is not None:
+                            peak.q_left = matched_peak.q_left
+                            peak.q_right = matched_peak.q_right
+                            peak.width_log_q = matched_peak.width_log_q
+                            peak.discovery_measurement_index = measurement_index
+                            peak.max_integrated_area = max(
+                                self.integrate_peak_area(
+                                    previous_measurement.spectrum,
+                                    peak.q_left,
+                                    peak.q_right,
+                                )
+                                for previous_measurement in self.measurements
+                            )
+                            continue
+                    peak.max_integrated_area = max(
+                        peak.max_integrated_area,
+                        self.integrate_peak_area(
+                            measurement.spectrum,
+                            peak.q_left,
+                            peak.q_right,
+                        ),
+                    )
+            self._peak_detection_measurement_count = len(self.measurements)
             return
         for measurement_index in range(
             self._peak_detection_measurement_count,
@@ -1333,10 +1508,27 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return np.asarray(
             [
                 [
-                    self.get_peak_height(
-                        self.measurements[measurement_index].spectrum,
-                        self.peak_dict[peak_id].q_left,
-                        self.peak_dict[peak_id].q_right,
+                    (
+                        max(
+                            float(
+                                np.interp(
+                                    self.peak_dict[peak_id].q_position,
+                                    self.q_grid,
+                                    self.measurements[
+                                        measurement_index
+                                    ].spectrum,
+                                )
+                            ),
+                            0.0,
+                        )
+                        if self.peak_dict[peak_id].width_log_q == 0
+                        else self.get_peak_height(
+                            self.measurements[
+                                measurement_index
+                            ].spectrum,
+                            self.peak_dict[peak_id].q_left,
+                            self.peak_dict[peak_id].q_right,
+                        )
                     )
                     for peak_id in peak_ids
                 ]

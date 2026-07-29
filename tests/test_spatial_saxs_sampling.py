@@ -284,6 +284,103 @@ def test_log_scale_detection_rejects_small_relative_ripple():
     assert peaks == []
 
 
+def test_known_peak_dictionary_is_authoritative_and_updates_widths(
+    monkeypatch,
+):
+    manager = configure_manager(
+        make_manager(),
+        num_q_points=256,
+        known_peak_q_values=[0.2, 0.6],
+    )
+    manager.measurements = [
+        SimpleNamespace(spectrum=np.ones(manager.num_q_points))
+    ]
+    initial_detections = [
+        DetectedSAXSPeak(
+            q_position=0.21,
+            log_q_position=np.log(0.21),
+            q_left=0.15,
+            q_right=0.27,
+            width_log_q=0.12,
+            height=8.0,
+            prominence=7.0,
+            integrated_area=1.0,
+        ),
+        DetectedSAXSPeak(
+            q_position=0.4,
+            log_q_position=np.log(0.4),
+            q_left=0.35,
+            q_right=0.45,
+            width_log_q=0.05,
+            height=8.0,
+            prominence=7.0,
+            integrated_area=10.0,
+        ),
+    ]
+    monkeypatch.setattr(
+        manager,
+        "detect_peaks",
+        lambda spectrum: initial_detections,
+    )
+
+    manager.update_peak_dictionary()
+
+    assert list(manager.peak_dict) == [0, 1]
+    np.testing.assert_array_equal(
+        [peak.q_position for peak in manager.peak_dict.values()],
+        np.array([0.2, 0.6]),
+    )
+    assert manager.peak_dict[0].width_log_q == 0.12
+    assert manager.peak_dict[1].width_log_q == 0.0
+    assert manager.get_peak_integrated_areas()[0, 1] == 0.0
+
+    manager.measurements.append(
+        SimpleNamespace(spectrum=np.full(manager.num_q_points, 2.0))
+    )
+    later_detection = DetectedSAXSPeak(
+        q_position=0.62,
+        log_q_position=np.log(0.62),
+        q_left=0.5,
+        q_right=0.72,
+        width_log_q=0.1,
+        height=8.0,
+        prominence=7.0,
+        integrated_area=2.0,
+    )
+    monkeypatch.setattr(
+        manager,
+        "detect_peaks",
+        lambda spectrum: [later_detection],
+    )
+
+    manager.update_peak_dictionary()
+
+    assert list(manager.peak_dict) == [0, 1]
+    assert manager.peak_dict[1].width_log_q == 0.1
+    assert manager.peak_dict[1].discovery_measurement_index == 1
+    assert np.all(manager.get_peak_integrated_areas()[:, 1] > 0)
+
+
+def test_unmatched_known_peak_height_uses_intensity_at_q(monkeypatch):
+    known_q = 0.2
+    manager = configure_manager(
+        make_manager(),
+        known_peak_q_values=[known_q],
+        peak_observable="height",
+    )
+    spectrum = 1.0 + 2.0 * manager.q_grid
+    manager.measurements = [SimpleNamespace(spectrum=spectrum)]
+    monkeypatch.setattr(manager, "detect_peaks", lambda spectrum: [])
+
+    manager.update_peak_dictionary()
+
+    np.testing.assert_allclose(
+        manager.get_peak_observables(),
+        np.array([[1.0 + 2.0 * known_q]]),
+    )
+    assert manager.peak_dict[0].width_log_q == 0.0
+
+
 def test_inverse_transform_peak_scores_returns_physical_observables():
     manager = configure_manager(make_manager(), peak_area_scale=2.0)
 
@@ -739,6 +836,26 @@ def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
 def test_configure_rejects_invalid_peak_observable():
     with pytest.raises(ValueError, match="`peak_observable`"):
         configure_manager(make_manager(), peak_observable="prominence")
+
+
+@pytest.mark.parametrize(
+    ("known_peak_q_values", "message"),
+    [
+        ([], "at least one"),
+        ([np.nan], "finite positive"),
+        ([0.2, 0.2], "duplicates"),
+        ([0.001], r"\[q_min, q_max\]"),
+    ],
+)
+def test_configure_rejects_invalid_known_peak_q_values(
+    known_peak_q_values,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        configure_manager(
+            make_manager(),
+            known_peak_q_values=known_peak_q_values,
+        )
 
 
 def test_configure_rejects_negative_exclusion_radius():
