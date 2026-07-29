@@ -265,7 +265,7 @@ def test_log_scale_detection_rejects_small_relative_ripple():
     assert peaks == []
 
 
-def test_predicted_peak_areas_undo_standardization():
+def test_inverse_transform_peak_scores_returns_physical_observables():
     manager = configure_manager(make_manager(), peak_area_scale=2.0)
 
     import torch
@@ -274,29 +274,32 @@ def test_predicted_peak_areas_undo_standardization():
     manager.peak_score_std = torch.tensor([0.5, 0.25], dtype=torch.double)
     standardized = torch.tensor([[2.0, -4.0]], dtype=torch.double)
 
-    areas = manager.compute_predicted_peak_areas(standardized)
+    observables = manager.inverse_transform_peak_scores(standardized)
 
     expected = 2.0 * np.expm1([2.0, 1.0])
-    np.testing.assert_allclose(areas.detach().cpu().numpy()[0], expected)
+    np.testing.assert_allclose(
+        observables.detach().cpu().numpy()[0],
+        expected,
+    )
 
 
-def test_predicted_peak_area_acquisition_uses_pointwise_maximum(monkeypatch):
+def test_predicted_peak_acquisition_uses_pointwise_maximum(monkeypatch):
     manager = configure_manager(make_manager())
 
     import torch
 
-    predicted_areas = torch.tensor(
+    predicted_observables = torch.tensor(
         [[1.0, 4.0, 2.0], [3.0, 2.0, 1.0]],
         dtype=torch.double,
     )
     monkeypatch.setattr(
         manager,
-        "compute_predicted_peak_areas",
-        lambda standardized_mean: predicted_areas,
+        "inverse_transform_peak_scores",
+        lambda standardized_mean: predicted_observables,
     )
 
-    maximum = manager.compute_predicted_max_peak_area(
-        torch.zeros_like(predicted_areas)
+    maximum = manager.compute_predicted_max_peak_observable(
+        torch.zeros_like(predicted_observables)
     )
 
     np.testing.assert_array_equal(
@@ -317,15 +320,15 @@ def test_peak_map_score_rejects_uniform_map_and_normalizes_per_peak(monkeypatch)
         )
     )
     uniform = torch.ones(100, dtype=torch.double)
-    predicted_areas = torch.stack((localized, uniform), dim=-1)
+    predicted_observables = torch.stack((localized, uniform), dim=-1)
     monkeypatch.setattr(
         manager,
-        "compute_predicted_peak_areas",
-        lambda standardized_mean: predicted_areas,
+        "inverse_transform_peak_scores",
+        lambda standardized_mean: predicted_observables,
     )
 
     score = manager.compute_concentration_gated_peak_score(
-        torch.zeros_like(predicted_areas)
+        torch.zeros_like(predicted_observables)
     )
 
     assert manager.peak_map_min_concentration == 0.15
@@ -340,21 +343,96 @@ def test_peak_map_score_is_zero_when_all_maps_are_uniform(monkeypatch):
 
     import torch
 
-    predicted_areas = torch.ones(100, 2, dtype=torch.double)
+    predicted_observables = torch.ones(100, 2, dtype=torch.double)
     monkeypatch.setattr(
         manager,
-        "compute_predicted_peak_areas",
-        lambda standardized_mean: predicted_areas,
+        "inverse_transform_peak_scores",
+        lambda standardized_mean: predicted_observables,
     )
 
     score = manager.compute_concentration_gated_peak_score(
-        torch.zeros_like(predicted_areas)
+        torch.zeros_like(predicted_observables)
     )
 
     np.testing.assert_array_equal(
         score.detach().cpu().numpy(),
         np.zeros(100),
     )
+
+
+def test_peak_height_observable_is_maximum_in_frozen_interval():
+    manager = configure_manager(make_manager(), peak_observable="height")
+    spectrum = np.zeros(manager.num_q_points)
+    spectrum[4:8] = [-1.0, 2.0, 5.0, 3.0]
+    manager.measurements = [SimpleNamespace(spectrum=spectrum)]
+    manager.peak_dict = {
+        0: SAXSPeak(
+            0,
+            manager.q_grid[6],
+            np.log(manager.q_grid[6]),
+            manager.q_grid[4],
+            manager.q_grid[7],
+            0.1,
+            1.0,
+            0,
+        )
+    }
+
+    observables = manager.get_peak_observables()
+
+    assert manager.peak_observable == "height"
+    np.testing.assert_array_equal(observables, np.array([[5.0]]))
+
+
+def test_height_observable_is_used_for_gp_targets(monkeypatch):
+    manager = configure_manager(make_manager(), peak_observable="height")
+    manager.measurements = [
+        SimpleNamespace(
+            position=np.array([float(index), 0.0]),
+            spectrum=np.eye(3, manager.num_q_points)[index] * height,
+        )
+        for index, height in enumerate((1.0, 3.0, 7.0))
+    ]
+    manager.peak_dict = {
+        0: SAXSPeak(
+            0,
+            manager.q_grid[1],
+            np.log(manager.q_grid[1]),
+            manager.q_grid[0],
+            manager.q_grid[2],
+            0.1,
+            1.0,
+            0,
+        )
+    }
+    fitted_targets = None
+
+    def fake_fit_gp(
+        train_x,
+        train_y,
+        max_fit_gp_mll_iterations=None,
+        fit_mll=True,
+    ):
+        nonlocal fitted_targets
+        fitted_targets = train_y
+        return object()
+
+    monkeypatch.setattr(manager, "fit_gp", fake_fit_gp)
+
+    standardized, _, _, _, _ = manager._fit_model(
+        [0, 1, 2],
+        fit_mll=False,
+    )
+
+    expected_scores = np.log1p([1.0, 3.0, 7.0])
+    expected = (
+        expected_scores - expected_scores.mean()
+    ) / expected_scores.std()
+    np.testing.assert_allclose(
+        standardized.detach().cpu().numpy()[:, 0],
+        expected,
+    )
+    assert fitted_targets is standardized
 
 
 def test_new_peak_evicts_dictionary_entry_with_smallest_maximum_area(monkeypatch):
@@ -569,6 +647,11 @@ def test_fit_gp_creates_independent_component_models_and_configures_iterations(
 def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
     with pytest.raises(ValueError, match=message):
         configure_manager(make_manager(), **kwargs)
+
+
+def test_configure_rejects_invalid_peak_observable():
+    with pytest.raises(ValueError, match="`peak_observable`"):
+        configure_manager(make_manager(), peak_observable="prominence")
 
 
 def test_configure_rejects_negative_new_peak_relative_area():

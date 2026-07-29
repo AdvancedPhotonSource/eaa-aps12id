@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import eaa_core.matplotlib_setup  # noqa: F401
 import matplotlib.pyplot as plt
@@ -76,6 +76,11 @@ class AcquisitionScores:
     peak_area_tilde: np.ndarray
     gradient_tilde: np.ndarray
 
+    @property
+    def peak_observable_tilde(self) -> np.ndarray:
+        """Return the normalized peak observable."""
+        return self.peak_area_tilde
+
 
 class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     """Adaptive sampler for spatially resolved SAXS.
@@ -83,7 +88,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     The workflow measures spectra on a finite spatial mesh, preprocesses each
     ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, subtracts a
     smooth background, and uses independent GP models for detected peak areas
-    to choose additional measurement positions.
+    or heights to choose additional measurement positions.
     """
 
     def __init__(
@@ -152,6 +157,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.max_peaks_in_dict: int | None = None
         self.new_peak_min_relative_area: float | None = None
         self.peak_map_min_concentration: float | None = None
+        self.peak_observable: str | None = None
         self.peak_area_scale: float | None = None
         self.exploration_interval: int | None = None
         self.max_fit_gp_mll_iterations: int | None = None
@@ -237,6 +243,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_peaks_in_dict: int = 10,
         new_peak_min_relative_area: float = 0.001,
         peak_map_min_concentration: float = 0.15,
+        peak_observable: Literal["height", "area"] = "area",
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -288,6 +295,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "peak_map_min_concentration": float(
                 peak_map_min_concentration
             ),
+            "peak_observable": str(peak_observable),
             "peak_area_scale": float(peak_area_scale),
             "exploration_interval": (
                 None
@@ -355,6 +363,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.peak_map_min_concentration = config[
             "peak_map_min_concentration"
         ]
+        self.peak_observable = config["peak_observable"]
         self.peak_area_scale = config["peak_area_scale"]
         self.exploration_interval = config["exploration_interval"]
         self.max_fit_gp_mll_iterations = config["max_fit_gp_mll_iterations"]
@@ -446,6 +455,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`peak_map_min_concentration` must be between zero and one."
             )
+        if self.peak_observable not in {"area", "height"}:
+            raise ValueError(
+                "`peak_observable` must be either 'area' or 'height'."
+            )
         if self.peak_area_scale <= 0:
             raise ValueError("`peak_area_scale` must be positive.")
         if self.exploration_interval is not None and self.exploration_interval < 1:
@@ -514,6 +527,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_peaks_in_dict: int = 10,
         new_peak_min_relative_area: float = 0.001,
         peak_map_min_concentration: float = 0.2,
+        peak_observable: Literal["height", "area"] = "area",
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -586,8 +600,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         peak_map_min_concentration : float
             Minimum fraction of total clipped map area contained in its
             largest ten percent of values for acquisition eligibility.
+        peak_observable : {"area", "height"}
+            Peak quantity modeled by the Gaussian processes and used by the
+            acquisition function. Height is the maximum positive
+            background-subtracted intensity in each frozen peak interval.
         peak_area_scale : float
-            Fixed area scale used by the ``log1p`` GP target transform.
+            Fixed scale used by the ``log1p`` GP target transform. This
+            parameter is also used when ``peak_observable="height"``.
         exploration_interval : int, optional
             Select the farthest unsampled position on every Nth adaptive step.
             When omitted, do not schedule farthest-point exploration.
@@ -595,7 +614,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Maximum optimizer iterations for GP marginal likelihood fitting.
             When omitted, do not impose an iteration limit.
         w_peak : float
-            Maximum predicted integrated-peak-area acquisition weight.
+            Maximum predicted peak-observable acquisition weight.
         w_g : float
             Spatial-gradient acquisition weight.
         epsilon_acquisition : float
@@ -648,6 +667,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             max_peaks_in_dict=max_peaks_in_dict,
             new_peak_min_relative_area=new_peak_min_relative_area,
             peak_map_min_concentration=peak_map_min_concentration,
+            peak_observable=peak_observable,
             peak_area_scale=peak_area_scale,
             exploration_interval=exploration_interval,
             max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
@@ -1105,6 +1125,19 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
         )
 
+    def get_peak_height(
+        self,
+        spectrum: np.ndarray,
+        q_left: float,
+        q_right: float,
+    ) -> float:
+        """Return the maximum positive intensity in a q interval."""
+        spectrum = np.asarray(spectrum, dtype=float).reshape(-1)
+        mask = (self.q_grid >= q_left) & (self.q_grid <= q_right)
+        if not np.any(mask):
+            return 0.0
+        return max(float(np.max(spectrum[mask])), 0.0)
+
     @staticmethod
     def _peak_intervals_overlap(
         q_left: float,
@@ -1252,8 +1285,43 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             dtype=float,
         )
 
+    def get_peak_heights(
+        self,
+        measurement_indices: list[int] | None = None,
+        peak_ids: list[int] | None = None,
+    ) -> np.ndarray:
+        """Return peak heights with measurements in rows and peaks in columns."""
+        if measurement_indices is None:
+            measurement_indices = list(range(len(self.measurements)))
+        if peak_ids is None:
+            peak_ids = sorted(self.peak_dict)
+        return np.asarray(
+            [
+                [
+                    self.get_peak_height(
+                        self.measurements[measurement_index].spectrum,
+                        self.peak_dict[peak_id].q_left,
+                        self.peak_dict[peak_id].q_right,
+                    )
+                    for peak_id in peak_ids
+                ]
+                for measurement_index in measurement_indices
+            ],
+            dtype=float,
+        )
+
+    def get_peak_observables(
+        self,
+        measurement_indices: list[int] | None = None,
+        peak_ids: list[int] | None = None,
+    ) -> np.ndarray:
+        """Return the configured peak observables."""
+        if self.peak_observable == "height":
+            return self.get_peak_heights(measurement_indices, peak_ids)
+        return self.get_peak_integrated_areas(measurement_indices, peak_ids)
+
     def refit_model(self) -> None:
-        """Update the peak dictionary and refit the independent peak-area GPs."""
+        """Update the peak dictionary and refit the independent peak GPs."""
         self._require_sampling_configured()
         self.update_peak_dictionary()
         fitting_indices = [
@@ -1262,7 +1330,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             if index not in self.excluded_measurement_indices
         ]
         self._record_progress_message(
-            "Updating peak-area Gaussian process models with "
+            f"Updating peak-{self.peak_observable} Gaussian process models with "
             f"{len(fitting_indices)} "
             "measurements."
         )
@@ -1301,14 +1369,14 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         measurement_indices: list[int],
         fit_mll: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], Any]:
-        """Fit independent GPs to transformed integrated peak areas."""
+        """Fit independent GPs to transformed peak observables."""
         peak_ids = sorted(self.peak_dict)
-        integrated_areas = torch.as_tensor(
-            self.get_peak_integrated_areas(measurement_indices, peak_ids),
+        peak_observables = torch.as_tensor(
+            self.get_peak_observables(measurement_indices, peak_ids),
             dtype=torch.double,
         )
         peak_scores = torch.log1p(
-            integrated_areas / self.peak_area_scale
+            peak_observables / self.peak_area_scale
         )
         peak_score_mean = peak_scores.mean(dim=0)
         peak_score_std = peak_scores.std(dim=0, unbiased=False)
@@ -1423,8 +1491,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         )
         with torch.no_grad():
             posterior = self.gp_model.posterior(candidate_x)
-            peak_area_mean = (
-                self.compute_predicted_peak_areas(posterior.mean)
+            peak_observable_mean = (
+                self.inverse_transform_peak_scores(posterior.mean)
                 .detach()
                 .cpu()
                 .numpy()
@@ -1438,9 +1506,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         panels: list[tuple[str, np.ndarray, np.ndarray | None]] = [
             ("Posterior uncertainty", self.candidate_positions, uncertainty),
             (
-                "Normalized maximum peak area",
+                f"Normalized maximum peak {self.peak_observable}",
                 scores.positions if scores is not None else self.candidate_positions,
-                scores.peak_area_tilde if scores is not None else None,
+                scores.peak_observable_tilde if scores is not None else None,
             ),
             (
                 "Gradient",
@@ -1455,7 +1523,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                     (
                         f"Peak at q={peak.q_position:.4g}",
                         self.candidate_positions,
-                        peak_area_mean[:, peak_index],
+                        peak_observable_mean[:, peak_index],
                     )
                 )
             else:
@@ -1720,7 +1788,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             posterior = self.gp_model.posterior(candidate_x)
             mean = posterior.mean
             variance = posterior.variance.clamp_min(0.0)
-            full_peak_area_tilde = None
+            full_peak_observable_tilde = None
         else:
             full_candidate_x = torch.as_tensor(
                 self.candidate_positions_normalized,
@@ -1737,7 +1805,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             variance = posterior.variance[
                 unsampled_tensor_indices
             ].clamp_min(0.0)
-            full_peak_area_tilde = (
+            full_peak_observable_tilde = (
                 self.compute_concentration_gated_peak_score(full_mean)
             )
         sigma = torch.sqrt(variance.mean(dim=-1))
@@ -1750,13 +1818,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 self.compute_peak_gradient_magnitude(candidate_x)
             )
         )
-        peak_area_tilde = (
+        peak_observable_tilde = (
             torch.zeros_like(sigma)
             if self.w_peak == 0
-            else full_peak_area_tilde[unsampled_tensor_indices]
+            else full_peak_observable_tilde[unsampled_tensor_indices]
         )
         acquisition = sigma_tilde * (
-            self.w_peak * peak_area_tilde
+            self.w_peak * peak_observable_tilde
             + self.w_g * gradient_tilde
             + self.epsilon_acquisition
         )
@@ -1764,69 +1832,85 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             positions=self.candidate_positions[unsampled_indices].copy(),
             acquisition=acquisition.detach().cpu().numpy(),
             sigma_tilde=sigma_tilde.detach().cpu().numpy(),
-            peak_area_tilde=peak_area_tilde.detach().cpu().numpy(),
+            peak_area_tilde=peak_observable_tilde.detach().cpu().numpy(),
             gradient_tilde=gradient_tilde.detach().cpu().numpy(),
         )
         self.latest_scores = scores
         del mean
         return scores
 
-    def compute_predicted_peak_areas(
+    def inverse_transform_peak_scores(
         self,
-        standardized_mean: "torch.Tensor",
+        standardized_scores: "torch.Tensor",
     ) -> "torch.Tensor":
-        """Undo target standardization and return predicted physical peak areas."""
+        """Transform standardized GP scores back to physical peak observables."""
         score_mean = self.peak_score_mean.to(
-            dtype=standardized_mean.dtype,
-            device=standardized_mean.device,
+            dtype=standardized_scores.dtype,
+            device=standardized_scores.device,
         )
         score_std = self.peak_score_std.to(
-            dtype=standardized_mean.dtype,
-            device=standardized_mean.device,
+            dtype=standardized_scores.dtype,
+            device=standardized_scores.device,
         )
-        transformed_mean = standardized_mean * (
+        transformed_scores = standardized_scores * (
             score_std + self.epsilon_z
         ) + score_mean
         return (
             self.peak_area_scale
-            * torch.expm1(transformed_mean)
+            * torch.expm1(transformed_scores)
         ).clamp_min(0.0)
+
+    def compute_predicted_peak_areas(
+        self,
+        standardized_mean: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return predicted observables under the legacy area-specific name."""
+        return self.inverse_transform_peak_scores(standardized_mean)
+
+    def compute_predicted_max_peak_observable(
+        self,
+        standardized_mean: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return the maximum predicted peak observable at each position."""
+        return self.inverse_transform_peak_scores(
+            standardized_mean
+        ).max(dim=-1).values
 
     def compute_predicted_max_peak_area(
         self,
         standardized_mean: "torch.Tensor",
     ) -> "torch.Tensor":
-        """Return the maximum predicted physical peak area at each position."""
-        return self.compute_predicted_peak_areas(
-            standardized_mean
-        ).max(dim=-1).values
+        """Return the maximum observable under the legacy area-specific name."""
+        return self.compute_predicted_max_peak_observable(standardized_mean)
 
     def compute_concentration_gated_peak_score(
         self,
         standardized_mean: "torch.Tensor",
     ) -> "torch.Tensor":
-        """Return the maximum robustly normalized eligible peak-area map."""
-        areas = self.compute_predicted_peak_areas(standardized_mean)
-        upper_caps = torch.quantile(areas, 0.99, dim=0)
-        clipped_areas = torch.minimum(areas, upper_caps.unsqueeze(0))
-        top_count = max(1, int(np.ceil(0.1 * areas.shape[0])))
-        top_area = torch.topk(
-            clipped_areas,
+        """Return the maximum robustly normalized eligible peak map."""
+        observables = self.inverse_transform_peak_scores(standardized_mean)
+        upper_caps = torch.quantile(observables, 0.99, dim=0)
+        clipped_observables = torch.minimum(
+            observables, upper_caps.unsqueeze(0)
+        )
+        top_count = max(1, int(np.ceil(0.1 * observables.shape[0])))
+        top_observable = torch.topk(
+            clipped_observables,
             k=top_count,
             dim=0,
         ).values.sum(dim=0)
-        total_area = clipped_areas.sum(dim=0)
-        concentration = top_area / (
-            total_area + self.epsilon_normalization
+        total_observable = clipped_observables.sum(dim=0)
+        concentration = top_observable / (
+            total_observable + self.epsilon_normalization
         )
         eligible = (
             concentration >= self.peak_map_min_concentration
-        ) & (total_area > self.epsilon_normalization)
+        ) & (total_observable > self.epsilon_normalization)
 
-        lower = torch.quantile(areas, 0.50, dim=0)
-        upper = torch.quantile(areas, 0.95, dim=0)
+        lower = torch.quantile(observables, 0.50, dim=0)
+        upper = torch.quantile(observables, 0.95, dim=0)
         normalized = (
-            (areas - lower.unsqueeze(0))
+            (observables - lower.unsqueeze(0))
             / (
                 upper.unsqueeze(0)
                 - lower.unsqueeze(0)
@@ -1835,9 +1919,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ).clamp(0.0, 1.0)
         if not torch.any(eligible):
             return torch.zeros(
-                areas.shape[0],
-                dtype=areas.dtype,
-                device=areas.device,
+                observables.shape[0],
+                dtype=observables.dtype,
+                device=observables.device,
             )
         return normalized[:, eligible].max(dim=-1).values
 
