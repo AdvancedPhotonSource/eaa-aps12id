@@ -305,6 +305,58 @@ def test_predicted_peak_area_acquisition_uses_pointwise_maximum(monkeypatch):
     )
 
 
+def test_peak_map_score_rejects_uniform_map_and_normalizes_per_peak(monkeypatch):
+    manager = configure_manager(make_manager())
+
+    import torch
+
+    localized = torch.cat(
+        (
+            torch.zeros(90, dtype=torch.double),
+            torch.ones(10, dtype=torch.double),
+        )
+    )
+    uniform = torch.ones(100, dtype=torch.double)
+    predicted_areas = torch.stack((localized, uniform), dim=-1)
+    monkeypatch.setattr(
+        manager,
+        "compute_predicted_peak_areas",
+        lambda standardized_mean: predicted_areas,
+    )
+
+    score = manager.compute_concentration_gated_peak_score(
+        torch.zeros_like(predicted_areas)
+    )
+
+    assert manager.peak_map_min_concentration == 0.15
+    np.testing.assert_allclose(
+        score.detach().cpu().numpy(),
+        localized.detach().cpu().numpy(),
+    )
+
+
+def test_peak_map_score_is_zero_when_all_maps_are_uniform(monkeypatch):
+    manager = configure_manager(make_manager())
+
+    import torch
+
+    predicted_areas = torch.ones(100, 2, dtype=torch.double)
+    monkeypatch.setattr(
+        manager,
+        "compute_predicted_peak_areas",
+        lambda standardized_mean: predicted_areas,
+    )
+
+    score = manager.compute_concentration_gated_peak_score(
+        torch.zeros_like(predicted_areas)
+    )
+
+    np.testing.assert_array_equal(
+        score.detach().cpu().numpy(),
+        np.zeros(100),
+    )
+
+
 def test_new_peak_evicts_dictionary_entry_with_smallest_maximum_area(monkeypatch):
     manager = configure_manager(
         make_manager(),
@@ -527,6 +579,15 @@ def test_configure_rejects_negative_new_peak_relative_area():
         )
 
 
+@pytest.mark.parametrize("value", [-0.1, 1.1])
+def test_configure_rejects_invalid_peak_map_concentration(value):
+    with pytest.raises(ValueError, match="`peak_map_min_concentration`"):
+        configure_manager(
+            make_manager(),
+            peak_map_min_concentration=value,
+        )
+
+
 def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
     manager = configure_manager(
         make_manager(),
@@ -549,7 +610,7 @@ def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
     manager.compute_peak_gradient_magnitude = lambda candidate_x: pytest.fail(
         "gradient calculation should be skipped"
     )
-    manager.compute_predicted_max_peak_area = lambda mean: pytest.fail(
+    manager.compute_concentration_gated_peak_score = lambda mean: pytest.fail(
         "peak-area calculation should be skipped"
     )
 

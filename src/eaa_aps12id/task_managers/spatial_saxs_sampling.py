@@ -151,6 +151,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.num_initial_peaks: int | None = None
         self.max_peaks_in_dict: int | None = None
         self.new_peak_min_relative_area: float | None = None
+        self.peak_map_min_concentration: float | None = None
         self.peak_area_scale: float | None = None
         self.exploration_interval: int | None = None
         self.max_fit_gp_mll_iterations: int | None = None
@@ -235,6 +236,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         num_initial_peaks: int = 5,
         max_peaks_in_dict: int = 10,
         new_peak_min_relative_area: float = 0.001,
+        peak_map_min_concentration: float = 0.15,
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -282,6 +284,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "max_peaks_in_dict": int(max_peaks_in_dict),
             "new_peak_min_relative_area": float(
                 new_peak_min_relative_area
+            ),
+            "peak_map_min_concentration": float(
+                peak_map_min_concentration
             ),
             "peak_area_scale": float(peak_area_scale),
             "exploration_interval": (
@@ -346,6 +351,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.max_peaks_in_dict = config["max_peaks_in_dict"]
         self.new_peak_min_relative_area = config[
             "new_peak_min_relative_area"
+        ]
+        self.peak_map_min_concentration = config[
+            "peak_map_min_concentration"
         ]
         self.peak_area_scale = config["peak_area_scale"]
         self.exploration_interval = config["exploration_interval"]
@@ -434,6 +442,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`new_peak_min_relative_area` must be nonnegative."
             )
+        if not (0 <= self.peak_map_min_concentration <= 1):
+            raise ValueError(
+                "`peak_map_min_concentration` must be between zero and one."
+            )
         if self.peak_area_scale <= 0:
             raise ValueError("`peak_area_scale` must be positive.")
         if self.exploration_interval is not None and self.exploration_interval < 1:
@@ -501,6 +513,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         num_initial_peaks: int = 5,
         max_peaks_in_dict: int = 10,
         new_peak_min_relative_area: float = 0.001,
+        peak_map_min_concentration: float = 0.2,
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -570,6 +583,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         new_peak_min_relative_area : float
             Minimum discovery-area ratio relative to the strongest active
             peak's historical maximum area for dynamic dictionary admission.
+        peak_map_min_concentration : float
+            Minimum fraction of total clipped map area contained in its
+            largest ten percent of values for acquisition eligibility.
         peak_area_scale : float
             Fixed area scale used by the ``log1p`` GP target transform.
         exploration_interval : int, optional
@@ -631,6 +647,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             num_initial_peaks=num_initial_peaks,
             max_peaks_in_dict=max_peaks_in_dict,
             new_peak_min_relative_area=new_peak_min_relative_area,
+            peak_map_min_concentration=peak_map_min_concentration,
             peak_area_scale=peak_area_scale,
             exploration_interval=exploration_interval,
             max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
@@ -1699,9 +1716,30 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             self.candidate_positions_normalized[unsampled_indices],
             dtype=torch.double,
         )
-        posterior = self.gp_model.posterior(candidate_x)
-        mean = posterior.mean
-        variance = posterior.variance.clamp_min(0.0)
+        if self.w_peak == 0:
+            posterior = self.gp_model.posterior(candidate_x)
+            mean = posterior.mean
+            variance = posterior.variance.clamp_min(0.0)
+            full_peak_area_tilde = None
+        else:
+            full_candidate_x = torch.as_tensor(
+                self.candidate_positions_normalized,
+                dtype=torch.double,
+            )
+            posterior = self.gp_model.posterior(full_candidate_x)
+            full_mean = posterior.mean
+            unsampled_tensor_indices = torch.as_tensor(
+                unsampled_indices,
+                dtype=torch.long,
+                device=full_mean.device,
+            )
+            mean = full_mean[unsampled_tensor_indices]
+            variance = posterior.variance[
+                unsampled_tensor_indices
+            ].clamp_min(0.0)
+            full_peak_area_tilde = (
+                self.compute_concentration_gated_peak_score(full_mean)
+            )
         sigma = torch.sqrt(variance.mean(dim=-1))
 
         sigma_tilde = self.normalize_tensor(sigma)
@@ -1715,9 +1753,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         peak_area_tilde = (
             torch.zeros_like(sigma)
             if self.w_peak == 0
-            else self.normalize_tensor(
-                self.compute_predicted_max_peak_area(mean)
-            )
+            else full_peak_area_tilde[unsampled_tensor_indices]
         )
         acquisition = sigma_tilde * (
             self.w_peak * peak_area_tilde
@@ -1764,6 +1800,46 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return self.compute_predicted_peak_areas(
             standardized_mean
         ).max(dim=-1).values
+
+    def compute_concentration_gated_peak_score(
+        self,
+        standardized_mean: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return the maximum robustly normalized eligible peak-area map."""
+        areas = self.compute_predicted_peak_areas(standardized_mean)
+        upper_caps = torch.quantile(areas, 0.99, dim=0)
+        clipped_areas = torch.minimum(areas, upper_caps.unsqueeze(0))
+        top_count = max(1, int(np.ceil(0.1 * areas.shape[0])))
+        top_area = torch.topk(
+            clipped_areas,
+            k=top_count,
+            dim=0,
+        ).values.sum(dim=0)
+        total_area = clipped_areas.sum(dim=0)
+        concentration = top_area / (
+            total_area + self.epsilon_normalization
+        )
+        eligible = (
+            concentration >= self.peak_map_min_concentration
+        ) & (total_area > self.epsilon_normalization)
+
+        lower = torch.quantile(areas, 0.50, dim=0)
+        upper = torch.quantile(areas, 0.95, dim=0)
+        normalized = (
+            (areas - lower.unsqueeze(0))
+            / (
+                upper.unsqueeze(0)
+                - lower.unsqueeze(0)
+                + self.epsilon_normalization
+            )
+        ).clamp(0.0, 1.0)
+        if not torch.any(eligible):
+            return torch.zeros(
+                areas.shape[0],
+                dtype=areas.dtype,
+                device=areas.device,
+            )
+        return normalized[:, eligible].max(dim=-1).values
 
     def compute_peak_gradient_magnitude(
         self,
