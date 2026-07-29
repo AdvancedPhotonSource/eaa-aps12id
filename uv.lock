@@ -632,6 +632,8 @@ dependencies = [
     { name = "gpytorch" },
     { name = "h5py" },
     { name = "scikit-learn" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
 ]
 
@@ -643,6 +645,7 @@ requires-dist = [
     { name = "gpytorch" },
     { name = "h5py" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "torch", index = "https://download.pytorch.org/whl/cu129" },
 ]
 

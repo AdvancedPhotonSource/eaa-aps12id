@@ -12,7 +12,10 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.models import ModelListGP, SingleTaskGP
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from sklearn.decomposition import NMF, SparsePCA
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+from scipy.sparse import diags
+from scipy.sparse.linalg import spsolve
 
 from eaa_core.api.llm_config import LLMConfig
 from eaa_core.api.memory import MemoryManagerConfig
@@ -31,6 +34,35 @@ class SAXSMeasurement:
     q: np.ndarray
     intensity: np.ndarray
     spectrum: np.ndarray
+    background: np.ndarray
+
+
+@dataclass
+class SAXSPeak:
+    """Peak definition shared by all measured SAXS spectra."""
+
+    peak_id: int
+    q_position: float
+    log_q_position: float
+    q_left: float
+    q_right: float
+    width_log_q: float
+    max_integrated_area: float
+    discovery_measurement_index: int
+
+
+@dataclass
+class DetectedSAXSPeak:
+    """Peak detected in one background-subtracted SAXS spectrum."""
+
+    q_position: float
+    log_q_position: float
+    q_left: float
+    q_right: float
+    width_log_q: float
+    height: float
+    prominence: float
+    integrated_area: float
 
 
 @dataclass
@@ -40,7 +72,7 @@ class AcquisitionScores:
     positions: np.ndarray
     acquisition: np.ndarray
     sigma_tilde: np.ndarray
-    q_div_tilde: np.ndarray
+    peak_area_tilde: np.ndarray
     gradient_tilde: np.ndarray
 
 
@@ -48,8 +80,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     """Adaptive sampler for spatially resolved SAXS.
 
     The workflow measures spectra on a finite spatial mesh, preprocesses each
-    ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, learns a latent
-    representation, and uses independent GP models for the latent components
+    ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, subtracts a
+    smooth background, and uses independent GP models for detected peak areas
     to choose additional measurement positions.
     """
 
@@ -104,16 +136,27 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.epsilon_intensity: float | None = None
         self.num_initial_samples: int | None = None
         self.max_measurements: int | None = None
-        self.num_components: int | None = None
-        self.dimension_reduction_method: str | None = None
+        self.background_smoothness: float | None = None
+        self.background_max_iterations: int | None = None
+        self.background_tolerance: float | None = None
+        self.peak_smoothing_sigma: float | None = None
+        self.peak_min_height: float | None = None
+        self.peak_min_prominence: float | None = None
+        self.peak_min_width_log_q: float | None = None
+        self.peak_max_width_log_q: float | None = None
+        self.peak_window_width_factor: float | None = None
+        self.num_initial_peaks: int | None = None
+        self.max_peaks_in_dict: int | None = None
+        self.peak_area_scale: float | None = None
+        self.exploration_interval: int | None = None
         self.max_fit_gp_mll_iterations: int | None = None
-        self.lambda_logdet: float | None = None
-        self.num_mc_samples: int | None = None
-        self.w_d: float | None = None
+        self.w_peak: float | None = None
         self.w_g: float | None = None
         self.epsilon_acquisition: float | None = None
         self.epsilon_normalization: float | None = None
         self.epsilon_z: float | None = None
+        self.normalization_lower_percentile: float | None = None
+        self.normalization_upper_percentile: float | None = None
         self.random_seed: int | None = None
         self.q_grid: np.ndarray | None = None
         self.position_min: np.ndarray | None = None
@@ -123,7 +166,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.measurements: list[SAXSMeasurement] = []
         self.measured_candidate_indices: list[int] = []
         self.excluded_measurement_indices: set[int] = set()
-        self.standardized_latent_scores: torch.Tensor | None = None
+        self.peak_dict: dict[int, SAXSPeak] = {}
+        self._next_peak_id = 0
+        self._peak_detection_measurement_count = 0
+        self.standardized_peak_scores: torch.Tensor | None = None
+        self.peak_score_mean: torch.Tensor | None = None
+        self.peak_score_std: torch.Tensor | None = None
+        self.modeled_peak_ids: list[int] = []
         self.gp_model = None
         self.latest_scores: AcquisitionScores | None = None
         self.posterior_visualization_tile_id: str | None = None
@@ -168,16 +217,27 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_intensity: float = 1e-12,
         num_initial_samples: int = 5,
         max_measurements: int = 20,
-        num_components: int = 2,
-        dimension_reduction_method: str = "pca",
+        background_smoothness: float = 1e6,
+        background_max_iterations: int = 50,
+        background_tolerance: float = 1e-3,
+        peak_smoothing_sigma: float = 1.0,
+        peak_min_height: float = 1.0,
+        peak_min_prominence: float = 1.0,
+        peak_min_width_log_q: float = 0.0,
+        peak_max_width_log_q: float | None = None,
+        peak_window_width_factor: float = 2.0,
+        num_initial_peaks: int = 5,
+        max_peaks_in_dict: int = 10,
+        peak_area_scale: float = 1.0,
+        exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
-        lambda_logdet: float = 1e-6,
-        num_mc_samples: int = 64,
-        w_d: float = 1.0,
+        w_peak: float = 1.0,
         w_g: float = 1.0,
         epsilon_acquisition: float = 1e-3,
         epsilon_normalization: float = 1e-12,
         epsilon_z: float = 1e-12,
+        normalization_lower_percentile: float = 5.0,
+        normalization_upper_percentile: float = 95.0,
         random_seed: int | None = None,
     ) -> None:
         """Configure sampling parameters for one adaptive run."""
@@ -192,20 +252,43 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "epsilon_intensity": float(epsilon_intensity),
             "num_initial_samples": int(num_initial_samples),
             "max_measurements": int(max_measurements),
-            "num_components": int(num_components),
-            "dimension_reduction_method": dimension_reduction_method,
+            "background_smoothness": float(background_smoothness),
+            "background_max_iterations": int(background_max_iterations),
+            "background_tolerance": float(background_tolerance),
+            "peak_smoothing_sigma": float(peak_smoothing_sigma),
+            "peak_min_height": float(peak_min_height),
+            "peak_min_prominence": float(peak_min_prominence),
+            "peak_min_width_log_q": float(peak_min_width_log_q),
+            "peak_max_width_log_q": (
+                None
+                if peak_max_width_log_q is None
+                else float(peak_max_width_log_q)
+            ),
+            "peak_window_width_factor": float(peak_window_width_factor),
+            "num_initial_peaks": int(num_initial_peaks),
+            "max_peaks_in_dict": int(max_peaks_in_dict),
+            "peak_area_scale": float(peak_area_scale),
+            "exploration_interval": (
+                None
+                if exploration_interval is None
+                else int(exploration_interval)
+            ),
             "max_fit_gp_mll_iterations": (
                 None
                 if max_fit_gp_mll_iterations is None
                 else int(max_fit_gp_mll_iterations)
             ),
-            "lambda_logdet": float(lambda_logdet),
-            "num_mc_samples": int(num_mc_samples),
-            "w_d": float(w_d),
+            "w_peak": float(w_peak),
             "w_g": float(w_g),
             "epsilon_acquisition": float(epsilon_acquisition),
             "epsilon_normalization": float(epsilon_normalization),
             "epsilon_z": float(epsilon_z),
+            "normalization_lower_percentile": float(
+                normalization_lower_percentile
+            ),
+            "normalization_upper_percentile": float(
+                normalization_upper_percentile
+            ),
             "random_seed": random_seed,
         }
         if self.measurements and self._sampling_config != config:
@@ -228,16 +311,31 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.epsilon_intensity = config["epsilon_intensity"]
         self.num_initial_samples = config["num_initial_samples"]
         self.max_measurements = config["max_measurements"]
-        self.num_components = config["num_components"]
-        self.dimension_reduction_method = config["dimension_reduction_method"]
+        self.background_smoothness = config["background_smoothness"]
+        self.background_max_iterations = config["background_max_iterations"]
+        self.background_tolerance = config["background_tolerance"]
+        self.peak_smoothing_sigma = config["peak_smoothing_sigma"]
+        self.peak_min_height = config["peak_min_height"]
+        self.peak_min_prominence = config["peak_min_prominence"]
+        self.peak_min_width_log_q = config["peak_min_width_log_q"]
+        self.peak_max_width_log_q = config["peak_max_width_log_q"]
+        self.peak_window_width_factor = config["peak_window_width_factor"]
+        self.num_initial_peaks = config["num_initial_peaks"]
+        self.max_peaks_in_dict = config["max_peaks_in_dict"]
+        self.peak_area_scale = config["peak_area_scale"]
+        self.exploration_interval = config["exploration_interval"]
         self.max_fit_gp_mll_iterations = config["max_fit_gp_mll_iterations"]
-        self.lambda_logdet = config["lambda_logdet"]
-        self.num_mc_samples = config["num_mc_samples"]
-        self.w_d = config["w_d"]
+        self.w_peak = config["w_peak"]
         self.w_g = config["w_g"]
         self.epsilon_acquisition = config["epsilon_acquisition"]
         self.epsilon_normalization = config["epsilon_normalization"]
         self.epsilon_z = config["epsilon_z"]
+        self.normalization_lower_percentile = config[
+            "normalization_lower_percentile"
+        ]
+        self.normalization_upper_percentile = config[
+            "normalization_upper_percentile"
+        ]
         self.random_seed = random_seed
         self._validate_parameters()
 
@@ -270,18 +368,39 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`max_measurements` cannot exceed the number of candidate positions."
             )
-        if self.num_components < 1:
-            raise ValueError("`num_components` must be positive.")
-        if self.num_components >= self.num_initial_samples:
+        if self.background_smoothness <= 0:
+            raise ValueError("`background_smoothness` must be positive.")
+        if self.background_max_iterations < 1:
+            raise ValueError("`background_max_iterations` must be positive.")
+        if self.background_tolerance <= 0:
+            raise ValueError("`background_tolerance` must be positive.")
+        if self.peak_smoothing_sigma < 0:
+            raise ValueError("`peak_smoothing_sigma` must be nonnegative.")
+        if self.peak_min_height < 0 or self.peak_min_prominence < 0:
             raise ValueError(
-                "`num_components` must be smaller than `num_initial_samples` "
-                "for initial dimensionality reduction fitting."
+                "`peak_min_height` and `peak_min_prominence` must be nonnegative."
             )
-        if self.dimension_reduction_method not in {"pca", "sparse_pca", "nmf"}:
+        if self.peak_min_width_log_q < 0:
+            raise ValueError("`peak_min_width_log_q` must be nonnegative.")
+        if (
+            self.peak_max_width_log_q is not None
+            and self.peak_max_width_log_q <= self.peak_min_width_log_q
+        ):
             raise ValueError(
-                "`dimension_reduction_method` must be one of "
-                "'pca', 'sparse_pca', or 'nmf'."
+                "`peak_max_width_log_q` must exceed `peak_min_width_log_q`."
             )
+        if self.peak_window_width_factor <= 0:
+            raise ValueError("`peak_window_width_factor` must be positive.")
+        if self.num_initial_peaks < 1:
+            raise ValueError("`num_initial_peaks` must be positive.")
+        if self.max_peaks_in_dict < self.num_initial_peaks:
+            raise ValueError(
+                "`max_peaks_in_dict` must be at least `num_initial_peaks`."
+            )
+        if self.peak_area_scale <= 0:
+            raise ValueError("`peak_area_scale` must be positive.")
+        if self.exploration_interval is not None and self.exploration_interval < 1:
+            raise ValueError("`exploration_interval` must be positive or None.")
         if (
             self.max_fit_gp_mll_iterations is not None
             and self.max_fit_gp_mll_iterations < 1
@@ -289,15 +408,23 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`max_fit_gp_mll_iterations` must be positive or None."
             )
-        if self.lambda_logdet <= 0:
-            raise ValueError("`lambda_logdet` must be positive.")
-        if self.num_mc_samples < 1:
-            raise ValueError("`num_mc_samples` must be positive.")
+        if self.w_peak < 0 or self.w_g < 0:
+            raise ValueError("`w_peak` and `w_g` must be nonnegative.")
         if self.epsilon_acquisition <= 0:
             raise ValueError("`epsilon_acquisition` must be positive.")
         if self.epsilon_normalization <= 0 or self.epsilon_z <= 0:
             raise ValueError(
                 "`epsilon_normalization` and `epsilon_z` must be positive."
+            )
+        if not (
+            0
+            <= self.normalization_lower_percentile
+            < self.normalization_upper_percentile
+            <= 100
+        ):
+            raise ValueError(
+                "Expected `0 <= normalization_lower_percentile < "
+                "normalization_upper_percentile <= 100`."
             )
 
     def create_log_q_grid(self) -> np.ndarray:
@@ -323,16 +450,27 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_intensity: float = 1e-12,
         num_initial_samples: int = 5,
         max_measurements: int = 20,
-        num_components: int = 2,
-        dimension_reduction_method: str = "pca",
+        background_smoothness: float = 1e6,
+        background_max_iterations: int = 50,
+        background_tolerance: float = 1e-3,
+        peak_smoothing_sigma: float = 1.0,
+        peak_min_height: float = 1.0,
+        peak_min_prominence: float = 1.0,
+        peak_min_width_log_q: float = 0.0,
+        peak_max_width_log_q: float | None = None,
+        peak_window_width_factor: float = 2.0,
+        num_initial_peaks: int = 5,
+        max_peaks_in_dict: int = 10,
+        peak_area_scale: float = 1.0,
+        exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
-        lambda_logdet: float = 1e-6,
-        num_mc_samples: int = 64,
-        w_d: float = 1.0,
+        w_peak: float = 1.0,
         w_g: float = 1.0,
         epsilon_acquisition: float = 1e-3,
         epsilon_normalization: float = 1e-12,
         epsilon_z: float = 1e-12,
+        normalization_lower_percentile: float = 5.0,
+        normalization_upper_percentile: float = 95.0,
         random_seed: int | None = None,
         n_iterations: int | None = None,
         non_position_kwargs_for_acquisition_tool: dict[str, Any] | None = None,
@@ -360,20 +498,40 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         max_measurements : int
             Total measurement budget, including initial measurements, denoted
             ``N_max``.
-        num_components : int
-            Number of retained dimensionality reduction components.
-        dimension_reduction_method : {"pca", "sparse_pca", "nmf"}
-            Dimensionality reduction method used to obtain latent scores.
+        background_smoothness : float
+            arPLS baseline smoothness penalty.
+        background_max_iterations : int
+            Maximum number of arPLS reweighting iterations.
+        background_tolerance : float
+            Relative arPLS weight-convergence tolerance.
+        peak_smoothing_sigma : float
+            Gaussian smoothing width in grid samples used only for detection.
+        peak_min_height : float
+            Minimum detected peak height in natural-log signal-to-noise units.
+        peak_min_prominence : float
+            Minimum natural-log peak prominence. A value of one requires an
+            approximately e-fold peak-to-local-base ratio.
+        peak_min_width_log_q : float
+            Minimum detected full width in log-q.
+        peak_max_width_log_q : float, optional
+            Maximum detected full width in log-q.
+        peak_window_width_factor : float
+            Factor applied to detected widths to define frozen integration
+            intervals.
+        num_initial_peaks : int
+            Maximum number of peaks admitted after initial measurements.
+        max_peaks_in_dict : int
+            Maximum number of active peak entries and GP models.
+        peak_area_scale : float
+            Fixed area scale used by the ``log1p`` GP target transform.
+        exploration_interval : int, optional
+            Select the farthest unsampled position on every Nth adaptive step.
+            When omitted, do not schedule farthest-point exploration.
         max_fit_gp_mll_iterations : int, optional
             Maximum optimizer iterations for GP marginal likelihood fitting.
             When omitted, do not impose an iteration limit.
-        lambda_logdet : float
-            Regularization added to the latent scatter matrix.
-        num_mc_samples : int
-            Number of Monte Carlo samples for expected diversity gain, denoted
-            ``N_mc``.
-        w_d : float
-            Diversity acquisition weight.
+        w_peak : float
+            Predicted integrated-peak-area acquisition weight.
         w_g : float
             Spatial-gradient acquisition weight.
         epsilon_acquisition : float
@@ -381,7 +539,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         epsilon_normalization : float
             Numerical constant for normalization denominators.
         epsilon_z : float
-            Numerical constant for latent standardization denominators.
+            Numerical constant for peak-target standardization denominators.
+        normalization_lower_percentile : float
+            Lower percentile used to robustly normalize acquisition terms.
+        normalization_upper_percentile : float
+            Upper percentile used to robustly normalize acquisition terms.
         random_seed : int, optional
             Seed for Sobol scrambling and posterior sampling.
         n_iterations : int, optional
@@ -403,16 +565,27 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             epsilon_intensity=epsilon_intensity,
             num_initial_samples=num_initial_samples,
             max_measurements=max_measurements,
-            num_components=num_components,
-            dimension_reduction_method=dimension_reduction_method,
+            background_smoothness=background_smoothness,
+            background_max_iterations=background_max_iterations,
+            background_tolerance=background_tolerance,
+            peak_smoothing_sigma=peak_smoothing_sigma,
+            peak_min_height=peak_min_height,
+            peak_min_prominence=peak_min_prominence,
+            peak_min_width_log_q=peak_min_width_log_q,
+            peak_max_width_log_q=peak_max_width_log_q,
+            peak_window_width_factor=peak_window_width_factor,
+            num_initial_peaks=num_initial_peaks,
+            max_peaks_in_dict=max_peaks_in_dict,
+            peak_area_scale=peak_area_scale,
+            exploration_interval=exploration_interval,
             max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
-            lambda_logdet=lambda_logdet,
-            num_mc_samples=num_mc_samples,
-            w_d=w_d,
+            w_peak=w_peak,
             w_g=w_g,
             epsilon_acquisition=epsilon_acquisition,
             epsilon_normalization=epsilon_normalization,
             epsilon_z=epsilon_z,
+            normalization_lower_percentile=normalization_lower_percentile,
+            normalization_upper_percentile=normalization_upper_percentile,
             random_seed=random_seed,
         )
         acquisition_kwargs = self._resolve_acquisition_kwargs(
@@ -528,12 +701,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         q, intensity = self.acquire_saxs(
             float(position[0]), float(position[1]), acquisition_kwargs
         )
-        spectrum = self.preprocess_spectrum(q, intensity)
+        spectrum, background = self._preprocess_spectrum_with_background(q, intensity)
         measurement = SAXSMeasurement(
             position=position.copy(),
             q=np.asarray(q, dtype=float),
             intensity=np.asarray(intensity, dtype=float),
             spectrum=spectrum,
+            background=background,
         )
         self.measurements.append(measurement)
         self.measured_candidate_indices.append(candidate_index)
@@ -570,7 +744,16 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return np.asarray(q, dtype=float), np.asarray(intensity, dtype=float)
 
     def preprocess_spectrum(self, q: np.ndarray, intensity: np.ndarray) -> np.ndarray:
-        """Interpolate one raw spectrum onto the common grid and log-transform it."""
+        """Interpolate a spectrum and subtract its arPLS background."""
+        spectrum, _ = self._preprocess_spectrum_with_background(q, intensity)
+        return spectrum
+
+    def _preprocess_spectrum_with_background(
+        self,
+        q: np.ndarray,
+        intensity: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return background-subtracted intensity and the fitted background."""
         self._require_sampling_configured()
         q = np.asarray(q, dtype=float).reshape(-1)
         intensity = np.asarray(intensity, dtype=float).reshape(-1)
@@ -594,23 +777,346 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 "Intensity values must be greater than `-epsilon_intensity`."
             )
         interpolated = np.interp(self.q_grid, q, intensity)
-        return np.log(interpolated + self.epsilon_intensity)
+        log_intensity = np.log(interpolated + self.epsilon_intensity)
+        log_background = self.fit_arpls_background(
+            log_intensity,
+            smoothness=self.background_smoothness,
+            max_iterations=self.background_max_iterations,
+            tolerance=self.background_tolerance,
+        )
+        background = np.maximum(
+            np.exp(log_background) - self.epsilon_intensity,
+            0.0,
+        )
+        return interpolated - background, background
+
+    @staticmethod
+    def fit_arpls_background(
+        values: np.ndarray,
+        smoothness: float,
+        max_iterations: int,
+        tolerance: float,
+    ) -> np.ndarray:
+        """Fit an asymmetrically reweighted penalized least-squares baseline.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            One-dimensional spectrum values on a uniformly spaced grid.
+        smoothness : float
+            Positive second-difference smoothness penalty.
+        max_iterations : int
+            Maximum number of asymmetric reweighting iterations.
+        tolerance : float
+            Relative convergence tolerance for the weights.
+
+        Returns
+        -------
+        numpy.ndarray
+            Smooth fitted baseline with the same shape as ``values``.
+        """
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if values.size < 3:
+            raise ValueError("arPLS background fitting requires at least three points.")
+        difference = diags(
+            [
+                np.ones(values.size - 2),
+                -2.0 * np.ones(values.size - 2),
+                np.ones(values.size - 2),
+            ],
+            [0, 1, 2],
+            shape=(values.size - 2, values.size),
+            format="csc",
+        )
+        penalty = smoothness * (difference.T @ difference)
+        weights = np.ones(values.size, dtype=float)
+        baseline = values.copy()
+        for _ in range(max_iterations):
+            weight_matrix = diags(weights, offsets=0, format="csc")
+            baseline = np.asarray(
+                spsolve(weight_matrix + penalty, weights * values),
+                dtype=float,
+            )
+            residual = values - baseline
+            negative = residual[residual < 0]
+            if negative.size < 2:
+                break
+            negative_mean = float(negative.mean())
+            negative_std = float(negative.std())
+            if negative_std <= np.finfo(float).eps:
+                break
+            exponent = np.clip(
+                2.0
+                * (
+                    residual
+                    - (2.0 * negative_std - negative_mean)
+                )
+                / negative_std,
+                -100.0,
+                100.0,
+            )
+            new_weights = 1.0 / (1.0 + np.exp(exponent))
+            relative_change = np.linalg.norm(new_weights - weights) / max(
+                np.linalg.norm(weights),
+                np.finfo(float).eps,
+            )
+            weights = new_weights
+            if relative_change < tolerance:
+                break
+        return baseline
+
+    def detect_peaks(self, spectrum: np.ndarray) -> list[DetectedSAXSPeak]:
+        """Detect significant peaks in one background-subtracted spectrum.
+
+        Height is evaluated as the natural log of robust signal-to-noise, and
+        prominence is therefore a natural-log peak-to-local-base ratio.
+        Detected widths and frozen integration intervals are represented in
+        log-q.
+        """
+        self._require_sampling_configured()
+        spectrum = np.asarray(spectrum, dtype=float).reshape(-1)
+        if spectrum.shape != self.q_grid.shape:
+            raise ValueError("Peak detection requires a spectrum on the common q grid.")
+        smoothed = (
+            spectrum
+            if self.peak_smoothing_sigma == 0
+            else gaussian_filter1d(
+                spectrum,
+                sigma=self.peak_smoothing_sigma,
+                mode="nearest",
+            )
+        )
+        differences = np.diff(spectrum)
+        difference_median = np.median(differences)
+        noise_scale = (
+            1.4826
+            * np.median(np.abs(differences - difference_median))
+            / np.sqrt(2.0)
+        )
+        noise_scale = max(
+            float(noise_scale),
+            np.finfo(float).eps * max(float(np.max(np.abs(spectrum))), 1.0),
+        )
+        detection_signal = np.log(np.maximum(smoothed / noise_scale, 1.0))
+        log_q = np.log(self.q_grid)
+        log_q_step = float(log_q[1] - log_q[0])
+        min_width_samples = self.peak_min_width_log_q / log_q_step
+        max_width_samples = (
+            None
+            if self.peak_max_width_log_q is None
+            else self.peak_max_width_log_q / log_q_step
+        )
+        peak_indices, properties = find_peaks(
+            detection_signal,
+            height=self.peak_min_height,
+            prominence=self.peak_min_prominence,
+            width=(min_width_samples, max_width_samples),
+        )
+
+        detected = []
+        for result_index, peak_index in enumerate(peak_indices):
+            width_log_q = max(
+                float(properties["widths"][result_index]) * log_q_step,
+                log_q_step,
+            )
+            half_window = (
+                0.5 * self.peak_window_width_factor * width_log_q
+            )
+            log_q_position = float(log_q[peak_index])
+            log_q_left = max(log_q_position - half_window, float(log_q[0]))
+            log_q_right = min(log_q_position + half_window, float(log_q[-1]))
+            q_left = float(np.exp(log_q_left))
+            q_right = float(np.exp(log_q_right))
+            detected.append(
+                DetectedSAXSPeak(
+                    q_position=float(self.q_grid[peak_index]),
+                    log_q_position=log_q_position,
+                    q_left=q_left,
+                    q_right=q_right,
+                    width_log_q=width_log_q,
+                    height=float(properties["peak_heights"][result_index]),
+                    prominence=float(properties["prominences"][result_index]),
+                    integrated_area=self.integrate_peak_area(
+                        spectrum,
+                        q_left,
+                        q_right,
+                    ),
+                )
+            )
+        return detected
+
+    def integrate_peak_area(
+        self,
+        spectrum: np.ndarray,
+        q_left: float,
+        q_right: float,
+    ) -> float:
+        """Integrate positive background-subtracted intensity over a q interval."""
+        spectrum = np.asarray(spectrum, dtype=float).reshape(-1)
+        mask = (self.q_grid >= q_left) & (self.q_grid <= q_right)
+        if np.count_nonzero(mask) < 2:
+            return 0.0
+        return float(
+            np.trapezoid(
+                np.maximum(spectrum[mask], 0.0),
+                self.q_grid[mask],
+            )
+        )
+
+    @staticmethod
+    def _peak_intervals_overlap(
+        q_left: float,
+        q_right: float,
+        other_q_left: float,
+        other_q_right: float,
+    ) -> bool:
+        """Return whether two width-derived q intervals overlap."""
+        return q_left <= other_q_right and other_q_left <= q_right
+
+    def _detected_peak_matches_dictionary(
+        self,
+        detected_peak: DetectedSAXSPeak,
+    ) -> bool:
+        """Return whether a detected peak overlaps an active dictionary entry."""
+        return any(
+            self._peak_intervals_overlap(
+                detected_peak.q_left,
+                detected_peak.q_right,
+                peak.q_left,
+                peak.q_right,
+            )
+            for peak in self.peak_dict.values()
+        )
+
+    def _add_detected_peak(
+        self,
+        detected_peak: DetectedSAXSPeak,
+        discovery_measurement_index: int,
+    ) -> None:
+        """Add one detected peak with a frozen center and integration interval."""
+        peak_id = self._next_peak_id
+        self._next_peak_id += 1
+        self.peak_dict[peak_id] = SAXSPeak(
+            peak_id=peak_id,
+            q_position=detected_peak.q_position,
+            log_q_position=detected_peak.log_q_position,
+            q_left=detected_peak.q_left,
+            q_right=detected_peak.q_right,
+            width_log_q=detected_peak.width_log_q,
+            max_integrated_area=max(
+                self.integrate_peak_area(
+                    measurement.spectrum,
+                    detected_peak.q_left,
+                    detected_peak.q_right,
+                )
+                for measurement in self.measurements
+            ),
+            discovery_measurement_index=discovery_measurement_index,
+        )
+
+    def _initialize_peak_dictionary(self) -> None:
+        """Build the initial dictionary from all initial spectra."""
+        candidates = []
+        for measurement_index, measurement in enumerate(self.measurements):
+            candidates.extend(
+                (peak, measurement_index)
+                for peak in self.detect_peaks(measurement.spectrum)
+            )
+        candidates.sort(
+            key=lambda item: item[0].integrated_area,
+            reverse=True,
+        )
+        for detected_peak, measurement_index in candidates:
+            if len(self.peak_dict) >= self.num_initial_peaks:
+                break
+            if not self._detected_peak_matches_dictionary(detected_peak):
+                self._add_detected_peak(detected_peak, measurement_index)
+        self._peak_detection_measurement_count = len(self.measurements)
+        if not self.peak_dict:
+            raise ValueError(
+                "No peaks met the configured height, prominence, and width "
+                "criteria in the initial SAXS measurements."
+            )
+
+    def update_peak_dictionary(self) -> None:
+        """Update peak areas and admit new peaks from unprocessed measurements."""
+        if not self.peak_dict:
+            self._initialize_peak_dictionary()
+            return
+        for measurement_index in range(
+            self._peak_detection_measurement_count,
+            len(self.measurements),
+        ):
+            measurement = self.measurements[measurement_index]
+            for peak in self.peak_dict.values():
+                peak.max_integrated_area = max(
+                    peak.max_integrated_area,
+                    self.integrate_peak_area(
+                        measurement.spectrum,
+                        peak.q_left,
+                        peak.q_right,
+                    ),
+                )
+            new_candidates = sorted(
+                self.detect_peaks(measurement.spectrum),
+                key=lambda peak: peak.integrated_area,
+                reverse=True,
+            )
+            for detected_peak in new_candidates:
+                if self._detected_peak_matches_dictionary(detected_peak):
+                    continue
+                self._add_detected_peak(detected_peak, measurement_index)
+                if len(self.peak_dict) > self.max_peaks_in_dict:
+                    weakest_peak_id = min(
+                        self.peak_dict,
+                        key=lambda peak_id: self.peak_dict[
+                            peak_id
+                        ].max_integrated_area,
+                    )
+                    del self.peak_dict[weakest_peak_id]
+        self._peak_detection_measurement_count = len(self.measurements)
+
+    def get_peak_integrated_areas(
+        self,
+        measurement_indices: list[int] | None = None,
+        peak_ids: list[int] | None = None,
+    ) -> np.ndarray:
+        """Return integrated areas with measurements in rows and peaks in columns."""
+        if measurement_indices is None:
+            measurement_indices = list(range(len(self.measurements)))
+        if peak_ids is None:
+            peak_ids = sorted(self.peak_dict)
+        return np.asarray(
+            [
+                [
+                    self.integrate_peak_area(
+                        self.measurements[measurement_index].spectrum,
+                        self.peak_dict[peak_id].q_left,
+                        self.peak_dict[peak_id].q_right,
+                    )
+                    for peak_id in peak_ids
+                ]
+                for measurement_index in measurement_indices
+            ],
+            dtype=float,
+        )
 
     def refit_model(self) -> None:
-        """Refit dimensionality reduction and the independent GP models."""
+        """Update the peak dictionary and refit the independent peak-area GPs."""
         self._require_sampling_configured()
+        self.update_peak_dictionary()
         fitting_indices = [
             index
             for index in range(len(self.measurements))
             if index not in self.excluded_measurement_indices
         ]
         self._record_progress_message(
-            "Updating dimensionality reduction and Gaussian process model with "
+            "Updating peak-area Gaussian process models with "
             f"{len(fitting_indices)} "
             "measurements."
         )
         try:
-            standardized_latent_scores, gp_model = self._fit_model(
+            model_state = self._fit_model(
                 fitting_indices, fit_mll=True
             )
         except RuntimeError as exc:
@@ -626,11 +1132,16 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
             logger.warning("%s Error: %s", message, exc)
             self._record_progress_message(message)
-            standardized_latent_scores, gp_model = self._fit_model(
+            model_state = self._fit_model(
                 fitting_indices, fit_mll=False
             )
-        self.standardized_latent_scores = standardized_latent_scores
-        self.gp_model = gp_model
+        (
+            self.standardized_peak_scores,
+            self.peak_score_mean,
+            self.peak_score_std,
+            self.modeled_peak_ids,
+            self.gp_model,
+        ) = model_state
         self._record_progress_message("Gaussian process model update complete.")
         self.publish_posterior_visualization()
 
@@ -638,23 +1149,21 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self,
         measurement_indices: list[int],
         fit_mll: bool,
-    ) -> tuple[torch.Tensor, Any]:
-        """Fit dimensionality reduction and a GP using selected measurements."""
-        spectra = torch.as_tensor(
-            np.vstack(
-                [self.measurements[index].spectrum for index in measurement_indices]
-            ),
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], Any]:
+        """Fit independent GPs to transformed integrated peak areas."""
+        peak_ids = sorted(self.peak_dict)
+        integrated_areas = torch.as_tensor(
+            self.get_peak_integrated_areas(measurement_indices, peak_ids),
             dtype=torch.double,
         )
-        latent_scores = self.fit_dimensionality_reduction(
-            spectra,
-            self.num_components,
-            self.dimension_reduction_method,
-            random_seed=self.random_seed,
+        peak_scores = torch.log1p(
+            integrated_areas / self.peak_area_scale
         )
-        standardized_latent_scores = self.standardize_latent_scores(
-            latent_scores, self.epsilon_z
-        )
+        peak_score_mean = peak_scores.mean(dim=0)
+        peak_score_std = peak_scores.std(dim=0, unbiased=False)
+        standardized_peak_scores = (
+            peak_scores - peak_score_mean
+        ) / (peak_score_std + self.epsilon_z)
         train_x = torch.as_tensor(
             self.normalize_positions(
                 np.vstack(
@@ -668,11 +1177,17 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         )
         gp_model = self.fit_gp(
             train_x,
-            standardized_latent_scores,
+            standardized_peak_scores,
             max_fit_gp_mll_iterations=self.max_fit_gp_mll_iterations,
             fit_mll=fit_mll,
         )
-        return standardized_latent_scores, gp_model
+        return (
+            standardized_peak_scores,
+            peak_score_mean,
+            peak_score_std,
+            peak_ids,
+            gp_model,
+        )
 
     def publish_posterior_visualization(self) -> None:
         """Publish the posterior status figure to the WebUI visualization tile."""
@@ -757,7 +1272,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         )
         with torch.no_grad():
             posterior = self.gp_model.posterior(candidate_x)
-            mean = posterior.mean.detach().cpu().numpy()
+            peak_area_mean = (
+                self.compute_predicted_peak_areas(posterior.mean)
+                .detach()
+                .cpu()
+                .numpy()
+            )
             variance = posterior.variance.clamp_min(0.0)
             uncertainty = torch.sqrt(variance.mean(dim=-1)).detach().cpu().numpy()
 
@@ -767,31 +1287,34 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         panels: list[tuple[str, np.ndarray, np.ndarray | None]] = [
             ("Posterior uncertainty", self.candidate_positions, uncertainty),
             (
-                "Log-det diversity",
+                "Predicted total peak area",
                 scores.positions if scores is not None else self.candidate_positions,
-                scores.q_div_tilde if scores is not None else None,
+                scores.peak_area_tilde if scores is not None else None,
             ),
             (
                 "Gradient",
                 scores.positions if scores is not None else self.candidate_positions,
                 scores.gradient_tilde if scores is not None else None,
             ),
-            (
-                "PC1 posterior mean",
-                self.candidate_positions,
-                mean[:, 0] if mean.shape[1] >= 1 else None,
-            ),
-            (
-                "PC2 posterior mean",
-                self.candidate_positions,
-                mean[:, 1] if mean.shape[1] >= 2 else None,
-            ),
-            (
-                "PC3 posterior mean",
-                self.candidate_positions,
-                mean[:, 2] if mean.shape[1] >= 3 else None,
-            ),
         ]
+        for peak_index in range(3):
+            if peak_index < len(self.modeled_peak_ids):
+                peak = self.peak_dict[self.modeled_peak_ids[peak_index]]
+                panels.append(
+                    (
+                        f"Peak at q={peak.q_position:.4g}",
+                        self.candidate_positions,
+                        peak_area_mean[:, peak_index],
+                    )
+                )
+            else:
+                panels.append(
+                    (
+                        f"Peak {peak_index + 1}",
+                        self.candidate_positions,
+                        None,
+                    )
+                )
         sampled_positions = self.measured_positions
         latest_position = sampled_positions[-1] if sampled_positions.size else None
         for ax, (title, positions, values) in zip(axes.ravel(), panels):
@@ -910,123 +1433,20 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.record_system_message(message, update_context=False)
 
     @staticmethod
-    def fit_pca(
-        spectra: "torch.Tensor", num_components: int
-    ) -> "torch.Tensor":
-        """Fit PCA and project the spectra into its latent space.
-
-        Parameters
-        ----------
-        spectra : torch.Tensor
-            Preprocessed spectra with shape ``(N, N_q)``.
-        num_components : int
-            Number of principal components to retain.
-
-        Returns
-        -------
-        torch.Tensor
-            PCA projections with shape ``(N, num_components)``.
-        """
-        if spectra.shape[0] <= num_components:
-            raise ValueError("Need more measured spectra than PCA components.")
-        pca_mean = spectra.mean(dim=0)
-        centered = spectra - pca_mean
-        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
-        pca_components = vh[:num_components]
-        return centered @ pca_components.T
-
-    @staticmethod
-    def fit_dimensionality_reduction(
-        spectra: "torch.Tensor",
-        num_components: int,
-        dimension_reduction_method: str,
-        random_seed: int | None = None,
-    ) -> "torch.Tensor":
-        """Fit a dimensionality reduction model and return latent scores.
-
-        Parameters
-        ----------
-        spectra : torch.Tensor
-            Preprocessed spectra with shape ``(N, N_q)``.
-        num_components : int
-            Number of latent components to retain.
-        dimension_reduction_method : {"pca", "sparse_pca", "nmf"}
-            Dimensionality reduction method.
-        random_seed : int, optional
-            Random seed passed to scikit-learn estimators.
-
-        Returns
-        -------
-        torch.Tensor
-            Latent scores with shape ``(N, num_components)``.
-        """
-        if dimension_reduction_method == "pca":
-            latent_scores =  SpatialSAXSAdaptiveSamplingTaskManager.fit_pca(
-                spectra, num_components
-            )
-            return latent_scores
-
-        spectra_array = spectra.detach().cpu().numpy()
-        if dimension_reduction_method == "sparse_pca":
-            latent_scores = SparsePCA(
-                n_components=num_components,
-                random_state=random_seed,
-            ).fit_transform(spectra_array)
-        elif dimension_reduction_method == "nmf":
-            nonnegative_spectra = spectra_array - spectra_array.min()
-            latent_scores = NMF(
-                n_components=num_components,
-                init="nndsvd",
-                random_state=random_seed,
-            ).fit_transform(nonnegative_spectra)
-        else:
-            raise ValueError(
-                "`dimension_reduction_method` must be one of "
-                "'pca', 'sparse_pca', or 'nmf'."
-            )
-        return torch.as_tensor(
-            latent_scores,
-            dtype=spectra.dtype,
-            device=spectra.device,
-        )
-
-    @staticmethod
-    def standardize_latent_scores(
-        latent_scores: "torch.Tensor", epsilon_z: float
-    ) -> "torch.Tensor":
-        """Standardize latent scores dimension-wise for GP training.
-
-        Parameters
-        ----------
-        latent_scores : torch.Tensor
-            Latent projections with shape ``(N, num_components)``.
-        epsilon_z : float
-            Stabilizing value added to each latent standard deviation.
-
-        Returns
-        -------
-        torch.Tensor
-            Standardized projections with the same shape as ``latent_scores``.
-        """
-        latent_mean = latent_scores.mean(dim=0)
-        latent_std = latent_scores.std(dim=0, unbiased=True)
-        return (latent_scores - latent_mean) / (latent_std + epsilon_z)
-
-    @staticmethod
     def fit_gp(
         train_x: "torch.Tensor",
         train_y: "torch.Tensor",
         max_fit_gp_mll_iterations: int | None = None,
         fit_mll: bool = True,
     ) -> Any:
-        """Fit independent GPs for latent components in normalized position space.
+        """Fit independent GPs for peak targets in normalized position space.
 
         Parameters
         ----------
         train_x : torch.Tensor
             Normalized measured positions with shape ``(N, 2)``.
         train_y : torch.Tensor
-            Standardized latent projections with shape ``(N, num_components)``.
+            Standardized peak targets with shape ``(N, N_peaks)``.
         max_fit_gp_mll_iterations : int, optional
             Maximum marginal likelihood optimizer iterations. When omitted,
             do not impose an iteration limit.
@@ -1038,11 +1458,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ModelListGP
             Fitted collection of independent Gaussian process models.
         """
-        component_models = []
-        for component_index in range(train_y.shape[-1]):
-            component_model = SingleTaskGP(
+        peak_models = []
+        for peak_index in range(train_y.shape[-1]):
+            peak_model = SingleTaskGP(
                 train_X=train_x,
-                train_Y=train_y[:, component_index : component_index + 1].double(),
+                train_Y=train_y[:, peak_index : peak_index + 1].double(),
                 covar_module=ScaleKernel(
                     MaternKernel(nu=2.5, ard_num_dims=2),
                 ),
@@ -1050,8 +1470,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
             if fit_mll:
                 mll = ExactMarginalLogLikelihood(
-                    component_model.likelihood,
-                    component_model,
+                    peak_model.likelihood,
+                    peak_model,
                 )
                 if max_fit_gp_mll_iterations is None:
                     fit_gpytorch_mll(mll)
@@ -1062,9 +1482,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                             "options": {"maxiter": max_fit_gp_mll_iterations}
                         },
                     )
-            component_models.append(component_model)
+            peak_models.append(peak_model)
 
-        gp_model = ModelListGP(*component_models)
+        gp_model = ModelListGP(*peak_models)
         gp_model.eval()
         return gp_model
 
@@ -1098,11 +1518,42 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 indices = self.get_initial_candidate_indices()[:k]
                 return self.candidate_positions[indices].copy()
             self.refit_model()
+        if k == 1 and self._is_farthest_exploration_step():
+            return self.get_farthest_unsampled_position()[None, :]
         scores = self.compute_acquisition_scores()
         if k > scores.positions.shape[0]:
             raise ValueError("`k` cannot exceed the number of unsampled candidates.")
         order = np.argsort(-scores.acquisition, kind="stable")
         return scores.positions[order[:k]].copy()
+
+    def _is_farthest_exploration_step(self) -> bool:
+        """Return whether the next adaptive step is scheduled for exploration."""
+        if self.exploration_interval is None:
+            return False
+        adaptive_measurements = max(
+            len(self.measurements) - self.num_initial_samples,
+            0,
+        )
+        return (adaptive_measurements + 1) % self.exploration_interval == 0
+
+    def get_farthest_unsampled_position(self) -> np.ndarray:
+        """Return the unsampled position farthest from all measured positions."""
+        unsampled_indices = self.get_unsampled_candidate_indices()
+        if unsampled_indices.size == 0:
+            raise ValueError("No unsampled candidate positions remain.")
+        if not self.measured_candidate_indices:
+            return self.candidate_positions[unsampled_indices[0]].copy()
+        unsampled = self.candidate_positions_normalized[unsampled_indices]
+        measured = self.candidate_positions_normalized[
+            self.measured_candidate_indices
+        ]
+        minimum_distances = np.linalg.norm(
+            unsampled[:, None, :] - measured[None, :, :],
+            axis=-1,
+        ).min(axis=1)
+        return self.candidate_positions[
+            unsampled_indices[int(np.argmax(minimum_distances))]
+        ].copy()
 
     def compute_acquisition_scores(self) -> AcquisitionScores:
         """Compute acquisition scores over all unsampled candidates."""
@@ -1124,18 +1575,18 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             torch.zeros_like(sigma)
             if self.w_g == 0
             else self.normalize_tensor(
-                self.compute_latent_gradient_magnitude(candidate_x)
+                self.compute_peak_gradient_magnitude(candidate_x)
             )
         )
-        q_div_tilde = (
+        peak_area_tilde = (
             torch.zeros_like(sigma)
-            if self.w_d == 0
+            if self.w_peak == 0
             else self.normalize_tensor(
-                self.compute_expected_logdet_diversity(posterior)
+                self.compute_predicted_total_peak_area(mean)
             )
         )
         acquisition = sigma_tilde * (
-            self.w_d * q_div_tilde
+            self.w_peak * peak_area_tilde
             + self.w_g * gradient_tilde
             + self.epsilon_acquisition
         )
@@ -1143,22 +1594,53 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             positions=self.candidate_positions[unsampled_indices].copy(),
             acquisition=acquisition.detach().cpu().numpy(),
             sigma_tilde=sigma_tilde.detach().cpu().numpy(),
-            q_div_tilde=q_div_tilde.detach().cpu().numpy(),
+            peak_area_tilde=peak_area_tilde.detach().cpu().numpy(),
             gradient_tilde=gradient_tilde.detach().cpu().numpy(),
         )
         self.latest_scores = scores
         del mean
         return scores
 
-    def compute_latent_gradient_magnitude(self, candidate_x: "torch.Tensor") -> "torch.Tensor":
-        """Return aggregate GP posterior-mean gradient magnitude."""
+    def compute_predicted_peak_areas(
+        self,
+        standardized_mean: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Undo target standardization and return predicted physical peak areas."""
+        score_mean = self.peak_score_mean.to(
+            dtype=standardized_mean.dtype,
+            device=standardized_mean.device,
+        )
+        score_std = self.peak_score_std.to(
+            dtype=standardized_mean.dtype,
+            device=standardized_mean.device,
+        )
+        transformed_mean = standardized_mean * (
+            score_std + self.epsilon_z
+        ) + score_mean
+        return (
+            self.peak_area_scale
+            * torch.expm1(transformed_mean)
+        ).clamp_min(0.0)
+
+    def compute_predicted_total_peak_area(
+        self,
+        standardized_mean: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return the sum of predicted physical integrated peak areas."""
+        return self.compute_predicted_peak_areas(standardized_mean).sum(dim=-1)
+
+    def compute_peak_gradient_magnitude(
+        self,
+        candidate_x: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return aggregate standardized peak-response gradient magnitude."""
         self._require_sampling_configured()
         x = candidate_x.clone().detach().requires_grad_(True)
         mean = self.gp_model.posterior(x).mean
         gradients = []
-        for latent_idx in range(self.num_components):
+        for peak_index in range(len(self.modeled_peak_ids)):
             grad = torch.autograd.grad(
-                mean[:, latent_idx].sum(),
+                mean[:, peak_index].sum(),
                 x,
                 retain_graph=True,
                 create_graph=False,
@@ -1167,58 +1649,20 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         stacked = torch.stack(gradients, dim=0)
         return torch.sqrt(torch.sum(stacked.pow(2), dim=(0, 2)).clamp_min(0.0))
 
-    def compute_expected_logdet_diversity(self, posterior: Any) -> "torch.Tensor":
-        """Estimate expected log-det latent diversity gain by Monte Carlo."""
-        self._require_sampling_configured()
-        samples = posterior.rsample(torch.Size([self.num_mc_samples]))
-        current = self.standardized_latent_scores.double()
-        return self.logdet_diversity_gain(current, samples).mean(dim=0)
-
-    def logdet_diversity_gain(
-        self,
-        current: "torch.Tensor",
-        candidates: "torch.Tensor",
-    ) -> "torch.Tensor":
-        """Return log-det scatter gain for candidate latent samples.
-
-        Parameters
-        ----------
-        current : torch.Tensor
-            Current standardized latent vectors with shape
-            ``(N_past, num_components)``.
-        candidates : torch.Tensor
-            Candidate latent vectors with shape ``(..., num_components)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Diversity gains with shape matching ``candidates.shape[:-1]``.
-        """
-        self._require_sampling_configured()
-        current = current.double()
-        candidates = candidates.double()
-        num_past = current.shape[0]
-        current_mean = current.mean(dim=0)
-        centered = current - current_mean
-        scatter = centered.T @ centered
-        eye = torch.eye(
-            self.num_components, dtype=current.dtype, device=current.device
-        )
-        base = self.lambda_logdet * eye + scatter
-        chol = torch.linalg.cholesky(base)
-        diff = candidates - current_mean
-        flat_diff = diff.reshape(-1, self.num_components)
-        solved = torch.cholesky_solve(flat_diff.T, chol).T
-        mahalanobis = (flat_diff * solved).sum(dim=-1)
-        factor = num_past / (num_past + 1)
-        gains = torch.log1p(factor * mahalanobis)
-        return gains.reshape(candidates.shape[:-1])
-
     def normalize_tensor(self, values: "torch.Tensor") -> "torch.Tensor":
-        """Min-max normalize a tensor with the configured normalization epsilon."""
+        """Robustly percentile-normalize a tensor to the interval [0, 1]."""
         self._require_sampling_configured()
-        return (values - values.min()) / (
-            values.max() - values.min() + self.epsilon_normalization
+        lower = torch.quantile(
+            values,
+            self.normalization_lower_percentile / 100.0,
+        )
+        upper = torch.quantile(
+            values,
+            self.normalization_upper_percentile / 100.0,
+        )
+        clipped = values.clamp(min=lower, max=upper)
+        return (clipped - lower) / (
+            upper - lower + self.epsilon_normalization
         )
 
     def get_candidate_index(self, position: np.ndarray) -> int:

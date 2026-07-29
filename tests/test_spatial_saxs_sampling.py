@@ -1,9 +1,12 @@
 import importlib.util
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from eaa_aps12id.task_managers.spatial_saxs_sampling import (
+    DetectedSAXSPeak,
+    SAXSPeak,
     SpatialSAXSAdaptiveSamplingTaskManager,
 )
 from eaa_core.gui.runtime import WebUIRuntimeController
@@ -47,8 +50,12 @@ def default_sampling_kwargs(**kwargs):
         "num_q_points": 16,
         "num_initial_samples": 3,
         "max_measurements": 5,
-        "num_components": 2,
-        "num_mc_samples": 4,
+        "background_smoothness": 1e3,
+        "peak_min_height": 0.0,
+        "peak_min_prominence": 0.0,
+        "num_initial_peaks": 1,
+        "max_peaks_in_dict": 2,
+        "exploration_interval": None,
         "random_seed": 1,
     }
     params.update(kwargs)
@@ -70,15 +77,20 @@ def configure_manager(manager, **kwargs):
     return manager
 
 
-def test_preprocess_spectrum_interpolates_and_log_transforms():
+def test_preprocess_spectrum_interpolates_and_subtracts_background(monkeypatch):
     manager = configure_manager(make_manager())
     q = np.geomspace(0.005, 1.5, 8)
     intensity = q * 2.0
+    monkeypatch.setattr(
+        manager,
+        "fit_arpls_background",
+        lambda values, **kwargs: np.full_like(values, np.log(0.01)),
+    )
 
     spectrum = manager.preprocess_spectrum(q[::-1], intensity[::-1])
 
-    expected = np.log(
-        np.interp(manager.q_grid, q, intensity) + manager.epsilon_intensity
+    expected = np.interp(manager.q_grid, q, intensity) - (
+        0.01 - manager.epsilon_intensity
     )
     np.testing.assert_allclose(spectrum, expected)
 
@@ -104,79 +116,147 @@ def test_initial_sobol_selection_is_unique_and_deterministic():
     assert len(set(indices_a)) == manager_a.num_initial_samples
 
 
-@pytest.mark.parametrize(
-    "dimension_reduction_method", ["pca", "sparse_pca", "nmf"]
-)
-def test_dimensionality_reduction_and_standardization_shapes(
-    dimension_reduction_method,
-):
-    manager = configure_manager(make_manager())
-    spectra = np.vstack(
-        [
-            np.linspace(0, 1, manager.num_q_points),
-            np.linspace(1, 0, manager.num_q_points),
-            np.sin(np.linspace(0, np.pi, manager.num_q_points)),
-            np.cos(np.linspace(0, np.pi, manager.num_q_points)),
-        ]
+def test_arpls_background_is_not_pulled_to_narrow_peak():
+    x = np.linspace(0.0, 1.0, 200)
+    background = 1.0 + 0.2 * x
+    values = background + 3.0 * np.exp(-((x - 0.5) / 0.025) ** 2)
+
+    fitted = SpatialSAXSAdaptiveSamplingTaskManager.fit_arpls_background(
+        values,
+        smoothness=1e5,
+        max_iterations=50,
+        tolerance=1e-4,
+    )
+
+    np.testing.assert_allclose(fitted, background, atol=0.08)
+
+
+def test_detect_peaks_uses_width_derived_area():
+    manager = configure_manager(
+        make_manager(),
+        num_q_points=256,
+        peak_min_height=1.0,
+        peak_min_prominence=3.0,
+    )
+    log_q = np.log(manager.q_grid)
+    spectrum = np.exp(-0.5 * ((log_q - np.log(0.2)) / 0.04) ** 2)
+
+    peaks = manager.detect_peaks(spectrum)
+
+    assert len(peaks) == 1
+    assert peaks[0].q_left < peaks[0].q_position < peaks[0].q_right
+    assert peaks[0].integrated_area > 0
+
+
+def test_log_scale_detection_rejects_small_relative_ripple():
+    manager = configure_manager(
+        make_manager(),
+        num_q_points=256,
+        peak_min_height=1.0,
+        peak_min_prominence=1.0,
+    )
+    log_q = np.log(manager.q_grid)
+    spectrum = 0.6 + 0.005 * np.exp(
+        -0.5 * ((log_q - np.log(0.03)) / 0.02) ** 2
+    )
+
+    peaks = manager.detect_peaks(spectrum)
+
+    assert peaks == []
+
+
+def test_predicted_peak_areas_undo_standardization():
+    manager = configure_manager(make_manager(), peak_area_scale=2.0)
+
+    import torch
+
+    manager.peak_score_mean = torch.tensor([1.0, 2.0], dtype=torch.double)
+    manager.peak_score_std = torch.tensor([0.5, 0.25], dtype=torch.double)
+    standardized = torch.tensor([[2.0, -4.0]], dtype=torch.double)
+
+    areas = manager.compute_predicted_peak_areas(standardized)
+
+    expected = 2.0 * np.expm1([2.0, 1.0])
+    np.testing.assert_allclose(areas.detach().cpu().numpy()[0], expected)
+
+
+def test_new_peak_evicts_dictionary_entry_with_smallest_maximum_area(monkeypatch):
+    manager = configure_manager(
+        make_manager(),
+        num_initial_peaks=1,
+        max_peaks_in_dict=2,
+    )
+    manager.peak_dict = {
+        0: SAXSPeak(0, 0.1, np.log(0.1), 0.09, 0.11, 0.02, 1.0, 0),
+        1: SAXSPeak(1, 0.3, np.log(0.3), 0.28, 0.32, 0.04, 10.0, 0),
+    }
+    manager._next_peak_id = 2
+    manager._peak_detection_measurement_count = 1
+    manager.measurements = [
+        SimpleNamespace(spectrum=np.zeros(manager.num_q_points)),
+        SimpleNamespace(spectrum=np.zeros(manager.num_q_points)),
+    ]
+    area_by_left = {0.09: 1.0, 0.28: 10.0, 0.48: 5.0}
+    monkeypatch.setattr(
+        manager,
+        "integrate_peak_area",
+        lambda spectrum, q_left, q_right: area_by_left[round(q_left, 2)],
+    )
+    monkeypatch.setattr(
+        manager,
+        "detect_peaks",
+        lambda spectrum: [
+            DetectedSAXSPeak(
+                q_position=0.5,
+                log_q_position=np.log(0.5),
+                q_left=0.48,
+                q_right=0.52,
+                width_log_q=0.04,
+                height=8.0,
+                prominence=7.0,
+                integrated_area=5.0,
+            )
+        ],
+    )
+
+    manager.update_peak_dictionary()
+
+    assert set(manager.peak_dict) == {1, 2}
+    assert manager.peak_dict[2].max_integrated_area == 5.0
+
+
+def test_scheduled_exploration_selects_farthest_unsampled_position():
+    manager = configure_manager(
+        make_manager(),
+        num_initial_samples=1,
+        exploration_interval=2,
+    )
+    manager.measurements = [SimpleNamespace(), SimpleNamespace()]
+    manager.measured_candidate_indices = [4]
+
+    assert manager._is_farthest_exploration_step()
+    np.testing.assert_array_equal(
+        manager.get_farthest_unsampled_position(),
+        np.array([0.0, 0.0]),
+    )
+
+
+def test_normalize_tensor_clips_to_configured_percentiles():
+    manager = configure_manager(
+        make_manager(),
+        normalization_lower_percentile=25.0,
+        normalization_upper_percentile=75.0,
     )
 
     import torch
 
-    latent_scores = manager.fit_dimensionality_reduction(
-        torch.as_tensor(spectra, dtype=torch.double),
-        manager.num_components,
-        dimension_reduction_method,
-        random_seed=manager.random_seed,
-    )
-    standardized_latent_scores = manager.standardize_latent_scores(
-        latent_scores, manager.epsilon_z
+    normalized = manager.normalize_tensor(
+        torch.tensor([0.0, 1.0, 2.0, 100.0], dtype=torch.double)
     )
 
-    assert latent_scores.shape == (4, manager.num_components)
-    assert standardized_latent_scores.shape == (4, manager.num_components)
-    np.testing.assert_allclose(
-        standardized_latent_scores.mean(dim=0).detach().cpu().numpy(),
-        np.zeros(manager.num_components),
-        atol=1e-12,
-    )
-
-
-def test_configure_rejects_unknown_dimensionality_reduction_method():
-    with pytest.raises(ValueError, match="`dimension_reduction_method` must be one of"):
-        configure_manager(make_manager(), dimension_reduction_method="tsne")
-
-
-def test_logdet_diversity_gain_matches_explicit_recompute():
-    manager = configure_manager(make_manager())
-
-    import torch
-
-    current = torch.tensor(
-        [[-1.0, 0.0], [0.0, 1.0], [1.0, -1.0]], dtype=torch.double
-    )
-    candidates = torch.tensor([[0.5, 0.5], [2.0, -1.0]], dtype=torch.double)
-
-    gains = manager.logdet_diversity_gain(current, candidates)
-
-    current_centered = current - current.mean(dim=0)
-    base = (
-        manager.lambda_logdet
-        * torch.eye(manager.num_components, dtype=torch.double)
-        + current_centered.T @ current_centered
-    )
-    expected = []
-    for candidate in candidates:
-        appended = torch.cat([current, candidate[None, :]], dim=0)
-        appended_centered = appended - appended.mean(dim=0)
-        new = (
-            manager.lambda_logdet
-            * torch.eye(manager.num_components, dtype=torch.double)
-            + appended_centered.T @ appended_centered
-        )
-        expected.append(torch.logdet(new) - torch.logdet(base))
-    expected = torch.stack(expected)
-
-    torch.testing.assert_close(gains, expected)
+    assert normalized[0] == 0
+    assert normalized[-1] == pytest.approx(1.0)
+    assert 0 < normalized[1] < normalized[2] < 1
 
 
 def test_run_collects_unique_measurements():
@@ -184,8 +264,7 @@ def test_run_collects_unique_measurements():
 
     manager.run(
         **default_sampling_kwargs(
-            num_q_points=8,
-            num_mc_samples=2,
+            num_q_points=64,
             max_measurements=4,
         )
     )
@@ -278,7 +357,7 @@ def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
 def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
     manager = configure_manager(
         make_manager(),
-        w_d=0.0,
+        w_peak=0.0,
         w_g=0.0,
     )
 
@@ -294,18 +373,18 @@ def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():
             return Posterior()
 
     manager.gp_model = GPModel()
-    manager.compute_latent_gradient_magnitude = lambda candidate_x: pytest.fail(
+    manager.compute_peak_gradient_magnitude = lambda candidate_x: pytest.fail(
         "gradient calculation should be skipped"
     )
-    manager.compute_expected_logdet_diversity = lambda posterior: pytest.fail(
-        "diversity calculation should be skipped"
+    manager.compute_predicted_total_peak_area = lambda mean: pytest.fail(
+        "peak-area calculation should be skipped"
     )
 
     scores = manager.compute_acquisition_scores()
 
     assert manager.epsilon_acquisition == 1e-3
     np.testing.assert_array_equal(scores.gradient_tilde, np.zeros(9))
-    np.testing.assert_array_equal(scores.q_div_tilde, np.zeros(9))
+    np.testing.assert_array_equal(scores.peak_area_tilde, np.zeros(9))
     np.testing.assert_allclose(
         scores.acquisition,
         manager.epsilon_acquisition * scores.sigma_tilde,
@@ -317,8 +396,7 @@ def test_run_forwards_non_position_acquisition_kwargs():
 
     manager.run(
         **default_sampling_kwargs(
-            num_q_points=8,
-            num_mc_samples=2,
+            num_q_points=64,
             max_measurements=4,
         ),
         non_position_kwargs_for_acquisition_tool={
@@ -344,8 +422,7 @@ def test_run_publishes_webui_progress_and_posterior_tile(tmp_path):
 
     manager.run(
         **default_sampling_kwargs(
-            num_q_points=8,
-            num_mc_samples=2,
+            num_q_points=64,
             max_measurements=4,
         )
     )
@@ -368,4 +445,7 @@ def test_run_publishes_webui_progress_and_posterior_tile(tmp_path):
     assert len(primary["visualization_tiles"]) == 2
     for tile in primary["visualization_tiles"]:
         assert tile["content"]["type"] == "image"
-        assert tile["content"]["image_path"].endswith(".png")
+        assert (
+            tile["content"].get("image_path", "").endswith(".png")
+            or tile["content"].get("image_url", "").startswith("data:image/png")
+        )
