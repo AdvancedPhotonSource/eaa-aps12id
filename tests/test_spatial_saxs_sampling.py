@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.ndimage import gaussian_filter1d
 
 from eaa_aps12id.task_managers.spatial_saxs_sampling import (
     DetectedSAXSPeak,
@@ -83,8 +84,11 @@ def test_preprocess_spectrum_interpolates_and_subtracts_background(monkeypatch):
     intensity = q * 2.0
     monkeypatch.setattr(
         manager,
-        "fit_arpls_background",
-        lambda values, **kwargs: np.full_like(values, np.log(0.01)),
+        "fit_valley_background",
+        lambda values, **kwargs: (
+            np.full_like(values, np.log(0.01)),
+            np.asarray([1, 2]),
+        ),
     )
 
     spectrum = manager.preprocess_spectrum(q[::-1], intensity[::-1])
@@ -131,6 +135,66 @@ def test_arpls_background_is_not_pulled_to_narrow_peak():
     np.testing.assert_allclose(fitted, background, atol=0.08)
 
 
+def test_valley_background_interpolates_between_peak_separating_valleys():
+    x = np.linspace(0.0, 1.0, 256)
+    intensity = np.ones_like(x)
+    for center in (0.2, 0.5, 0.8):
+        intensity += 2.0 * np.exp(-0.5 * ((x - center) / 0.035) ** 2)
+
+    fitted, valley_indices = (
+        SpatialSAXSAdaptiveSamplingTaskManager.fit_valley_background(
+            np.log(intensity),
+            smoothing_sigma=2.0,
+            min_prominence=0.05,
+        )
+    )
+
+    assert fitted is not None
+    assert valley_indices.size == 2
+    for center in (0.2, 0.5, 0.8):
+        peak_index = int(np.argmin(np.abs(x - center)))
+        assert fitted[peak_index] < np.log(intensity[peak_index]) - 0.5
+
+
+def test_valley_background_defers_to_fallback_with_fewer_than_two_valleys():
+    fitted, valley_indices = (
+        SpatialSAXSAdaptiveSamplingTaskManager.fit_valley_background(
+            np.linspace(1.0, 0.0, 64),
+            smoothing_sigma=2.0,
+            min_prominence=0.05,
+        )
+    )
+
+    assert fitted is None
+    assert valley_indices.size == 0
+
+
+def test_preprocess_uses_smoothed_spectrum_when_valleys_are_insufficient():
+    manager = configure_manager(
+        make_manager(),
+        num_q_points=64,
+        background_valley_smoothing_sigma=2.0,
+    )
+    q = manager.q_grid.copy()
+    q[0] = manager.q_min
+    q[-1] = manager.q_max
+    intensity = 2.0 * q**-0.5
+
+    _, fitted = manager._preprocess_spectrum_with_background(
+        q,
+        intensity,
+    )
+
+    interpolated = np.interp(manager.q_grid, q, intensity)
+    expected_log_background = gaussian_filter1d(
+        np.log(interpolated + manager.epsilon_intensity),
+        sigma=manager.background_valley_smoothing_sigma,
+        mode="nearest",
+    )
+    expected = np.exp(expected_log_background) - manager.epsilon_intensity
+    np.testing.assert_allclose(fitted, expected)
+
+
 def test_detect_peaks_uses_width_derived_area():
     manager = configure_manager(
         make_manager(),
@@ -146,6 +210,42 @@ def test_detect_peaks_uses_width_derived_area():
     assert len(peaks) == 1
     assert peaks[0].q_left < peaks[0].q_position < peaks[0].q_right
     assert peaks[0].integrated_area > 0
+
+
+def test_detect_peaks_measures_width_on_linear_corrected_intensity():
+    manager = configure_manager(
+        make_manager(),
+        num_q_points=256,
+        peak_min_height=1.0,
+        peak_min_prominence=1.0,
+    )
+    log_q = np.log(manager.q_grid)
+    spectrum = 0.6 + 10.0 * np.exp(
+        -0.5 * ((log_q - np.log(0.2)) / 0.05) ** 2
+    )
+
+    peaks = manager.detect_peaks(spectrum)
+
+    assert len(peaks) == 1
+    assert peaks[0].width_log_q < 0.2
+
+
+def test_default_minimum_width_rejects_narrow_noise_peak():
+    manager = configure_manager(
+        make_manager(),
+        num_q_points=512,
+        peak_min_height=1.0,
+        peak_min_prominence=1.0,
+    )
+    log_q = np.log(manager.q_grid)
+    spectrum = np.exp(
+        -0.5 * ((log_q - np.log(0.2)) / 0.005) ** 2
+    )
+
+    peaks = manager.detect_peaks(spectrum)
+
+    assert manager.peak_min_width_log_q == 0.03
+    assert peaks == []
 
 
 def test_log_scale_detection_rejects_small_relative_ripple():
@@ -223,6 +323,46 @@ def test_new_peak_evicts_dictionary_entry_with_smallest_maximum_area(monkeypatch
 
     assert set(manager.peak_dict) == {1, 2}
     assert manager.peak_dict[2].max_integrated_area == 5.0
+
+
+def test_new_peak_below_relative_area_gate_is_not_admitted(monkeypatch):
+    manager = configure_manager(make_manager())
+    manager.peak_dict = {
+        0: SAXSPeak(0, 0.1, np.log(0.1), 0.09, 0.11, 0.02, 10.0, 0),
+    }
+    manager._next_peak_id = 1
+    manager._peak_detection_measurement_count = 1
+    manager.measurements = [
+        SimpleNamespace(spectrum=np.zeros(manager.num_q_points)),
+        SimpleNamespace(spectrum=np.zeros(manager.num_q_points)),
+    ]
+    monkeypatch.setattr(
+        manager,
+        "integrate_peak_area",
+        lambda spectrum, q_left, q_right: 10.0,
+    )
+    monkeypatch.setattr(
+        manager,
+        "detect_peaks",
+        lambda spectrum: [
+            DetectedSAXSPeak(
+                q_position=0.5,
+                log_q_position=np.log(0.5),
+                q_left=0.48,
+                q_right=0.52,
+                width_log_q=0.04,
+                height=8.0,
+                prominence=7.0,
+                integrated_area=0.005,
+            )
+        ],
+    )
+
+    manager.update_peak_dictionary()
+
+    assert manager.new_peak_min_relative_area == 0.001
+    assert set(manager.peak_dict) == {0}
+    assert manager._next_peak_id == 1
 
 
 def test_scheduled_exploration_selects_farthest_unsampled_position():
@@ -352,6 +492,14 @@ def test_fit_gp_creates_independent_component_models_and_configures_iterations(
 def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
     with pytest.raises(ValueError, match=message):
         configure_manager(make_manager(), **kwargs)
+
+
+def test_configure_rejects_negative_new_peak_relative_area():
+    with pytest.raises(ValueError, match="`new_peak_min_relative_area`"):
+        configure_manager(
+            make_manager(),
+            new_peak_min_relative_area=-0.1,
+        )
 
 
 def test_zero_weights_reduce_acquisition_to_uncertainty_baseline():

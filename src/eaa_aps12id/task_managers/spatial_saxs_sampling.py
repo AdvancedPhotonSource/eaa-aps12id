@@ -13,7 +13,8 @@ from botorch.models import ModelListGP, SingleTaskGP
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import find_peaks
+from scipy.interpolate import PchipInterpolator
+from scipy.signal import find_peaks, peak_widths
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 
@@ -139,6 +140,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.background_smoothness: float | None = None
         self.background_max_iterations: int | None = None
         self.background_tolerance: float | None = None
+        self.background_valley_smoothing_sigma: float | None = None
+        self.background_valley_min_prominence: float | None = None
         self.peak_smoothing_sigma: float | None = None
         self.peak_min_height: float | None = None
         self.peak_min_prominence: float | None = None
@@ -147,6 +150,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.peak_window_width_factor: float | None = None
         self.num_initial_peaks: int | None = None
         self.max_peaks_in_dict: int | None = None
+        self.new_peak_min_relative_area: float | None = None
         self.peak_area_scale: float | None = None
         self.exploration_interval: int | None = None
         self.max_fit_gp_mll_iterations: int | None = None
@@ -220,14 +224,17 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         background_smoothness: float = 1e6,
         background_max_iterations: int = 50,
         background_tolerance: float = 1e-3,
+        background_valley_smoothing_sigma: float = 3.0,
+        background_valley_min_prominence: float = 0.05,
         peak_smoothing_sigma: float = 1.0,
         peak_min_height: float = 1.0,
         peak_min_prominence: float = 1.0,
-        peak_min_width_log_q: float = 0.0,
+        peak_min_width_log_q: float = 0.03,
         peak_max_width_log_q: float | None = None,
         peak_window_width_factor: float = 2.0,
         num_initial_peaks: int = 5,
         max_peaks_in_dict: int = 10,
+        new_peak_min_relative_area: float = 0.001,
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -255,6 +262,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "background_smoothness": float(background_smoothness),
             "background_max_iterations": int(background_max_iterations),
             "background_tolerance": float(background_tolerance),
+            "background_valley_smoothing_sigma": float(
+                background_valley_smoothing_sigma
+            ),
+            "background_valley_min_prominence": float(
+                background_valley_min_prominence
+            ),
             "peak_smoothing_sigma": float(peak_smoothing_sigma),
             "peak_min_height": float(peak_min_height),
             "peak_min_prominence": float(peak_min_prominence),
@@ -267,6 +280,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "peak_window_width_factor": float(peak_window_width_factor),
             "num_initial_peaks": int(num_initial_peaks),
             "max_peaks_in_dict": int(max_peaks_in_dict),
+            "new_peak_min_relative_area": float(
+                new_peak_min_relative_area
+            ),
             "peak_area_scale": float(peak_area_scale),
             "exploration_interval": (
                 None
@@ -314,6 +330,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.background_smoothness = config["background_smoothness"]
         self.background_max_iterations = config["background_max_iterations"]
         self.background_tolerance = config["background_tolerance"]
+        self.background_valley_smoothing_sigma = config[
+            "background_valley_smoothing_sigma"
+        ]
+        self.background_valley_min_prominence = config[
+            "background_valley_min_prominence"
+        ]
         self.peak_smoothing_sigma = config["peak_smoothing_sigma"]
         self.peak_min_height = config["peak_min_height"]
         self.peak_min_prominence = config["peak_min_prominence"]
@@ -322,6 +344,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.peak_window_width_factor = config["peak_window_width_factor"]
         self.num_initial_peaks = config["num_initial_peaks"]
         self.max_peaks_in_dict = config["max_peaks_in_dict"]
+        self.new_peak_min_relative_area = config[
+            "new_peak_min_relative_area"
+        ]
         self.peak_area_scale = config["peak_area_scale"]
         self.exploration_interval = config["exploration_interval"]
         self.max_fit_gp_mll_iterations = config["max_fit_gp_mll_iterations"]
@@ -374,6 +399,14 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError("`background_max_iterations` must be positive.")
         if self.background_tolerance <= 0:
             raise ValueError("`background_tolerance` must be positive.")
+        if self.background_valley_smoothing_sigma <= 0:
+            raise ValueError(
+                "`background_valley_smoothing_sigma` must be positive."
+            )
+        if self.background_valley_min_prominence < 0:
+            raise ValueError(
+                "`background_valley_min_prominence` must be nonnegative."
+            )
         if self.peak_smoothing_sigma < 0:
             raise ValueError("`peak_smoothing_sigma` must be nonnegative.")
         if self.peak_min_height < 0 or self.peak_min_prominence < 0:
@@ -396,6 +429,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         if self.max_peaks_in_dict < self.num_initial_peaks:
             raise ValueError(
                 "`max_peaks_in_dict` must be at least `num_initial_peaks`."
+            )
+        if self.new_peak_min_relative_area < 0:
+            raise ValueError(
+                "`new_peak_min_relative_area` must be nonnegative."
             )
         if self.peak_area_scale <= 0:
             raise ValueError("`peak_area_scale` must be positive.")
@@ -453,14 +490,17 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         background_smoothness: float = 1e6,
         background_max_iterations: int = 50,
         background_tolerance: float = 1e-3,
+        background_valley_smoothing_sigma: float = 3.0,
+        background_valley_min_prominence: float = 0.05,
         peak_smoothing_sigma: float = 1.0,
         peak_min_height: float = 1.0,
         peak_min_prominence: float = 1.0,
-        peak_min_width_log_q: float = 0.0,
+        peak_min_width_log_q: float = 0.03,
         peak_max_width_log_q: float | None = None,
         peak_window_width_factor: float = 2.0,
         num_initial_peaks: int = 5,
         max_peaks_in_dict: int = 10,
+        new_peak_min_relative_area: float = 0.001,
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -504,6 +544,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Maximum number of arPLS reweighting iterations.
         background_tolerance : float
             Relative arPLS weight-convergence tolerance.
+        background_valley_smoothing_sigma : float
+            Gaussian smoothing width in grid samples used to find background
+            valleys in log-intensity.
+        background_valley_min_prominence : float
+            Minimum valley prominence in natural-log intensity.
         peak_smoothing_sigma : float
             Gaussian smoothing width in grid samples used only for detection.
         peak_min_height : float
@@ -522,6 +567,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Maximum number of peaks admitted after initial measurements.
         max_peaks_in_dict : int
             Maximum number of active peak entries and GP models.
+        new_peak_min_relative_area : float
+            Minimum discovery-area ratio relative to the strongest active
+            peak's historical maximum area for dynamic dictionary admission.
         peak_area_scale : float
             Fixed area scale used by the ``log1p`` GP target transform.
         exploration_interval : int, optional
@@ -568,6 +616,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             background_smoothness=background_smoothness,
             background_max_iterations=background_max_iterations,
             background_tolerance=background_tolerance,
+            background_valley_smoothing_sigma=(
+                background_valley_smoothing_sigma
+            ),
+            background_valley_min_prominence=(
+                background_valley_min_prominence
+            ),
             peak_smoothing_sigma=peak_smoothing_sigma,
             peak_min_height=peak_min_height,
             peak_min_prominence=peak_min_prominence,
@@ -576,6 +630,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             peak_window_width_factor=peak_window_width_factor,
             num_initial_peaks=num_initial_peaks,
             max_peaks_in_dict=max_peaks_in_dict,
+            new_peak_min_relative_area=new_peak_min_relative_area,
             peak_area_scale=peak_area_scale,
             exploration_interval=exploration_interval,
             max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
@@ -744,7 +799,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         return np.asarray(q, dtype=float), np.asarray(intensity, dtype=float)
 
     def preprocess_spectrum(self, q: np.ndarray, intensity: np.ndarray) -> np.ndarray:
-        """Interpolate a spectrum and subtract its arPLS background."""
+        """Interpolate a spectrum and subtract its fitted background."""
         spectrum, _ = self._preprocess_spectrum_with_background(q, intensity)
         return spectrum
 
@@ -778,17 +833,83 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
         interpolated = np.interp(self.q_grid, q, intensity)
         log_intensity = np.log(interpolated + self.epsilon_intensity)
-        log_background = self.fit_arpls_background(
+        log_background, _ = self.fit_valley_background(
             log_intensity,
-            smoothness=self.background_smoothness,
-            max_iterations=self.background_max_iterations,
-            tolerance=self.background_tolerance,
+            smoothing_sigma=self.background_valley_smoothing_sigma,
+            min_prominence=self.background_valley_min_prominence,
         )
+        if log_background is None:
+            log_background = gaussian_filter1d(
+                log_intensity,
+                sigma=self.background_valley_smoothing_sigma,
+                mode="nearest",
+            )
         background = np.maximum(
             np.exp(log_background) - self.epsilon_intensity,
             0.0,
         )
         return interpolated - background, background
+
+    @staticmethod
+    def fit_valley_background(
+        values: np.ndarray,
+        smoothing_sigma: float,
+        min_prominence: float,
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        """Fit a shape-preserving background through spectral valleys.
+
+        The input is assumed to be sampled uniformly in log-q. It is smoothed
+        before valleys are found as peaks of its negative. When at least two
+        valleys are present, PCHIP interpolates their smoothed values together
+        with five-point median endpoint anchors. Otherwise, no background is
+        returned so the caller can use the smoothed spectrum.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            One-dimensional log-intensity spectrum.
+        smoothing_sigma : float
+            Gaussian smoothing width in grid samples.
+        min_prominence : float
+            Minimum valley prominence in log-intensity.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            Interpolated log-background, or ``None`` when fewer than two
+            valleys are found.
+        numpy.ndarray
+            Indices of the detected valleys.
+        """
+        values = np.asarray(values, dtype=float).reshape(-1)
+        smoothed = gaussian_filter1d(
+            values,
+            sigma=smoothing_sigma,
+            mode="nearest",
+        )
+        valley_indices, _ = find_peaks(
+            -smoothed,
+            prominence=min_prominence,
+        )
+        if valley_indices.size < 2:
+            return None, valley_indices
+
+        endpoint_points = min(5, values.size)
+        anchor_indices = np.concatenate(
+            ([0], valley_indices, [values.size - 1])
+        )
+        anchor_values = np.concatenate(
+            (
+                [float(np.median(values[:endpoint_points]))],
+                smoothed[valley_indices],
+                [float(np.median(values[-endpoint_points:]))],
+            )
+        )
+        background = PchipInterpolator(
+            anchor_indices,
+            anchor_values,
+        )(np.arange(values.size))
+        return np.asarray(background, dtype=float), valley_indices
 
     @staticmethod
     def fit_arpls_background(
@@ -870,8 +991,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
         Height is evaluated as the natural log of robust signal-to-noise, and
         prominence is therefore a natural-log peak-to-local-base ratio.
-        Detected widths and frozen integration intervals are represented in
-        log-q.
+        Peak widths are measured at half height on the linear corrected
+        intensity, then represented in log-q for the frozen integration
+        intervals.
         """
         self._require_sampling_configured()
         spectrum = np.asarray(spectrum, dtype=float).reshape(-1)
@@ -900,25 +1022,28 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         detection_signal = np.log(np.maximum(smoothed / noise_scale, 1.0))
         log_q = np.log(self.q_grid)
         log_q_step = float(log_q[1] - log_q[0])
-        min_width_samples = self.peak_min_width_log_q / log_q_step
-        max_width_samples = (
-            None
-            if self.peak_max_width_log_q is None
-            else self.peak_max_width_log_q / log_q_step
-        )
         peak_indices, properties = find_peaks(
             detection_signal,
             height=self.peak_min_height,
             prominence=self.peak_min_prominence,
-            width=(min_width_samples, max_width_samples),
         )
+        detected_widths = peak_widths(
+            np.maximum(smoothed, 0.0),
+            peak_indices,
+            rel_height=0.5,
+        )[0]
 
         detected = []
         for result_index, peak_index in enumerate(peak_indices):
-            width_log_q = max(
-                float(properties["widths"][result_index]) * log_q_step,
-                log_q_step,
-            )
+            width_log_q = float(detected_widths[result_index]) * log_q_step
+            if width_log_q < self.peak_min_width_log_q:
+                continue
+            if (
+                self.peak_max_width_log_q is not None
+                and width_log_q > self.peak_max_width_log_q
+            ):
+                continue
+            width_log_q = max(width_log_q, log_q_step)
             half_window = (
                 0.5 * self.peak_window_width_factor * width_log_q
             )
@@ -1057,6 +1182,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                         peak.q_right,
                     ),
                 )
+            strongest_peak_area = max(
+                peak.max_integrated_area
+                for peak in self.peak_dict.values()
+            )
+            minimum_new_peak_area = (
+                self.new_peak_min_relative_area * strongest_peak_area
+            )
             new_candidates = sorted(
                 self.detect_peaks(measurement.spectrum),
                 key=lambda peak: peak.integrated_area,
@@ -1064,6 +1196,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
             for detected_peak in new_candidates:
                 if self._detected_peak_matches_dictionary(detected_peak):
+                    continue
+                if detected_peak.integrated_area < minimum_new_peak_area:
                     continue
                 self._add_detected_peak(detected_peak, measurement_index)
                 if len(self.peak_dict) > self.max_peaks_in_dict:
