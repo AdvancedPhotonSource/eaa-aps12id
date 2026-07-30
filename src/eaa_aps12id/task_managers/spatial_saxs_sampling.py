@@ -12,7 +12,7 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.models import ModelListGP, SingleTaskGP
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.interpolate import PchipInterpolator
 from scipy.signal import find_peaks, peak_widths
 from scipy.sparse import diags
@@ -160,6 +160,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.new_peak_min_relative_area: float | None = None
         self.peak_map_min_concentration: float | None = None
         self.peak_observable: str | None = None
+        self.peak_observale_map_blur: float | None = None
         self.peak_area_scale: float | None = None
         self.exploration_interval: int | None = None
         self.max_fit_gp_mll_iterations: int | None = None
@@ -250,6 +251,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         new_peak_min_relative_area: float = 0.001,
         peak_map_min_concentration: float = 0.15,
         peak_observable: Literal["height", "area"] = "area",
+        peak_observale_map_blur: float | None = None,
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -317,6 +319,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 peak_map_min_concentration
             ),
             "peak_observable": str(peak_observable),
+            "peak_observale_map_blur": (
+                None
+                if peak_observale_map_blur is None
+                else float(peak_observale_map_blur)
+            ),
             "peak_area_scale": float(peak_area_scale),
             "exploration_interval": (
                 None
@@ -391,6 +398,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             "peak_map_min_concentration"
         ]
         self.peak_observable = config["peak_observable"]
+        self.peak_observale_map_blur = config[
+            "peak_observale_map_blur"
+        ]
         self.peak_area_scale = config["peak_area_scale"]
         self.exploration_interval = config["exploration_interval"]
         self.max_fit_gp_mll_iterations = config["max_fit_gp_mll_iterations"]
@@ -518,6 +528,28 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             raise ValueError(
                 "`peak_observable` must be either 'area' or 'height'."
             )
+        if self.peak_observale_map_blur is not None and (
+            not np.isfinite(self.peak_observale_map_blur)
+            or self.peak_observale_map_blur < 0
+        ):
+            raise ValueError(
+                "`peak_observale_map_blur` must be finite and nonnegative "
+                "or None."
+            )
+        if self.peak_observale_map_blur and (
+            not np.allclose(
+                np.abs(np.diff(self.x_values)),
+                np.abs(np.diff(self.x_values))[0],
+            )
+            or not np.allclose(
+                np.abs(np.diff(self.y_values)),
+                np.abs(np.diff(self.y_values))[0],
+            )
+        ):
+            raise ValueError(
+                "`peak_observale_map_blur` requires evenly spaced x and y "
+                "values."
+            )
         if self.peak_area_scale <= 0:
             raise ValueError("`peak_area_scale` must be positive.")
         if self.exploration_interval is not None and self.exploration_interval < 1:
@@ -591,6 +623,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         new_peak_min_relative_area: float = 0.001,
         peak_map_min_concentration: float = 0.2,
         peak_observable: Literal["height", "area"] = "area",
+        peak_observale_map_blur: float | None = None,
         peak_area_scale: float = 1.0,
         exploration_interval: int | None = 5,
         max_fit_gp_mll_iterations: int | None = None,
@@ -676,6 +709,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Peak quantity modeled by the Gaussian processes and used by the
             acquisition function. Height is the maximum positive
             background-subtracted intensity in each frozen peak interval.
+        peak_observale_map_blur : float, optional
+            Gaussian standard deviation used to blur predicted peak-observable
+            maps before they enter the acquisition function. The value is in
+            the same physical units as ``x_values`` and ``y_values``, which
+            must be evenly spaced when blurring is enabled.
         peak_area_scale : float
             Fixed scale used by the ``log1p`` GP target transform. This
             parameter is also used when ``peak_observable="height"``.
@@ -742,6 +780,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             new_peak_min_relative_area=new_peak_min_relative_area,
             peak_map_min_concentration=peak_map_min_concentration,
             peak_observable=peak_observable,
+            peak_observale_map_blur=peak_observale_map_blur,
             peak_area_scale=peak_area_scale,
             exploration_interval=exploration_interval,
             max_fit_gp_mll_iterations=max_fit_gp_mll_iterations,
@@ -2141,6 +2180,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
     ) -> "torch.Tensor":
         """Return the maximum robustly normalized eligible peak map."""
         observables = self.inverse_transform_peak_scores(standardized_mean)
+        observables = self.blur_peak_observable_maps(observables)
         upper_caps = torch.quantile(observables, 0.99, dim=0)
         clipped_observables = torch.minimum(
             observables, upper_caps.unsqueeze(0)
@@ -2176,6 +2216,48 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 device=observables.device,
             )
         return normalized[:, eligible].max(dim=-1).values
+
+    def blur_peak_observable_maps(
+        self,
+        observables: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blur peak-observable maps using a physical spatial width.
+
+        Parameters
+        ----------
+        observables : torch.Tensor
+            Peak observables with one row per candidate position and one
+            column per modeled peak.
+
+        Returns
+        -------
+        torch.Tensor
+            Peak observables after spatial Gaussian smoothing.
+        """
+        if not self.peak_observale_map_blur:
+            return observables
+
+        x_spacing = np.abs(np.diff(self.x_values))
+        y_spacing = np.abs(np.diff(self.y_values))
+
+        observable_maps = observables.detach().cpu().numpy().reshape(
+            len(self.y_values),
+            len(self.x_values),
+            -1,
+        )
+        blurred = gaussian_filter(
+            observable_maps,
+            sigma=(
+                self.peak_observale_map_blur / y_spacing[0],
+                self.peak_observale_map_blur / x_spacing[0],
+                0.0,
+            ),
+        )
+        return torch.as_tensor(
+            blurred.reshape(observables.shape),
+            dtype=observables.dtype,
+            device=observables.device,
+        )
 
     def compute_peak_gradient_magnitude(
         self,

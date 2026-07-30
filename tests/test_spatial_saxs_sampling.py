@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 
 from eaa_aps12id.task_managers.spatial_saxs_sampling import (
     DetectedSAXSPeak,
@@ -476,6 +476,31 @@ def test_peak_map_score_is_zero_when_all_maps_are_uniform(monkeypatch):
     )
 
 
+def test_peak_observable_map_blur_uses_physical_axis_units():
+    manager = configure_manager(
+        make_manager(),
+        x_values=[0.0, 2.0, 4.0],
+        y_values=[0.0, 0.5, 1.0],
+        peak_observale_map_blur=1.0,
+    )
+
+    import torch
+
+    observables = torch.zeros(9, 1, dtype=torch.double)
+    observables[4, 0] = 1.0
+
+    blurred = manager.blur_peak_observable_maps(observables)
+
+    expected = gaussian_filter(
+        observables.numpy().reshape(3, 3, 1),
+        sigma=(2.0, 0.5, 0.0),
+    )
+    np.testing.assert_allclose(
+        blurred.detach().cpu().numpy(),
+        expected.reshape(9, 1),
+    )
+
+
 def test_peak_height_observable_is_maximum_in_frozen_interval():
     manager = configure_manager(make_manager(), peak_observable="height")
     spectrum = np.zeros(manager.num_q_points)
@@ -836,6 +861,26 @@ def test_configure_rejects_invalid_gp_fit_parameters(kwargs, message):
 def test_configure_rejects_invalid_peak_observable():
     with pytest.raises(ValueError, match="`peak_observable`"):
         configure_manager(make_manager(), peak_observable="prominence")
+
+
+@pytest.mark.parametrize("peak_observale_map_blur", [-0.1, np.inf])
+def test_configure_rejects_invalid_peak_observable_map_blur(
+    peak_observale_map_blur,
+):
+    with pytest.raises(ValueError, match="`peak_observale_map_blur`"):
+        configure_manager(
+            make_manager(),
+            peak_observale_map_blur=peak_observale_map_blur,
+        )
+
+
+def test_configure_rejects_peak_observable_map_blur_on_uneven_grid():
+    with pytest.raises(ValueError, match="evenly spaced"):
+        configure_manager(
+            make_manager(),
+            x_values=[0.0, 1.0, 3.0],
+            peak_observale_map_blur=1.0,
+        )
 
 
 @pytest.mark.parametrize(
