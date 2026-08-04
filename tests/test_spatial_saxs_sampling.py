@@ -3,16 +3,19 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from eaa_core.gui.runtime import WebUIRuntimeController
+from eaa_core.tool.base import BaseTool
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
 
 from eaa_aps12id.task_managers.spatial_saxs_sampling import (
-    DetectedSAXSPeak,
-    SAXSPeak,
     SpatialSAXSAdaptiveSamplingTaskManager,
 )
-from eaa_core.gui.runtime import WebUIRuntimeController
-from eaa_core.tool.base import BaseTool
-
+from eaa_aps12id.tools.spatial_saxs_sampling import (
+    DetectedSAXSPeak,
+    SAXSMeasurement,
+    SAXSPeak,
+    SpatialSAXSAdaptiveSamplingEngineTool,
+)
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None
@@ -74,8 +77,100 @@ def make_manager(**kwargs):
 
 
 def configure_manager(manager, **kwargs):
-    manager._configure_sampling_run(**default_sampling_kwargs(**kwargs))
-    return manager
+    params = default_sampling_kwargs(**kwargs)
+    params.pop("max_measurements")
+    manager.engine_tool.initialize(**params)
+    return manager.engine_tool
+
+
+def record_candidate(engine, candidate_index):
+    """Record a dummy spectrum without triggering an engine refit."""
+    position = engine.candidate_positions[candidate_index]
+    q, intensity = DummySAXSTool().acquire_saxs(
+        x=float(position[0]),
+        y=float(position[1]),
+        q_min=engine.q_min,
+        q_max=engine.q_max,
+    )
+    spectrum, background = engine._preprocess_spectrum_with_background(
+        q, intensity
+    )
+    engine.measurements.append(
+        SAXSMeasurement(
+            position=position.copy(),
+            q=q,
+            intensity=intensity,
+            spectrum=spectrum,
+            background=background,
+        )
+    )
+    engine.measured_candidate_indices.append(candidate_index)
+
+
+def test_engine_exposes_standalone_interface_without_acquisition_tool():
+    engine = SpatialSAXSAdaptiveSamplingEngineTool()
+
+    assert isinstance(engine, BaseTool)
+    assert not hasattr(engine, "acquisition_tool")
+    exposed_names = {spec.name for spec in engine.exposed_tools}
+    assert {
+        "spatial_saxs_adaptive_sampling_engine.initialize",
+        "spatial_saxs_adaptive_sampling_engine.suggest_initial_measurements",
+        "spatial_saxs_adaptive_sampling_engine.suggest",
+        "spatial_saxs_adaptive_sampling_engine.update",
+    } <= exposed_names
+
+
+def test_manager_accepts_injected_engine():
+    engine = SpatialSAXSAdaptiveSamplingEngineTool()
+
+    manager = make_manager(engine_tool=engine)
+
+    assert manager.engine_tool is engine
+
+
+def test_suggest_initial_measurements_returns_engine_optimized_path(monkeypatch):
+    engine = configure_manager(make_manager())
+    monkeypatch.setattr(engine, "get_initial_candidate_indices", lambda: [0, 1, 2])
+    monkeypatch.setattr(
+        engine,
+        "_optimize_suggestion_path",
+        lambda positions: positions[::-1].copy(),
+    )
+
+    suggestions = engine.suggest_initial_measurements()
+
+    np.testing.assert_array_equal(
+        suggestions,
+        engine.candidate_positions[[2, 1, 0]],
+    )
+
+
+def test_engine_update_accepts_variable_length_spectrum_batch(monkeypatch):
+    engine = configure_manager(make_manager(), num_q_points=64)
+    refit_calls = []
+    monkeypatch.setattr(engine, "refit_model", lambda: refit_calls.append(True))
+    positions = engine.candidate_positions[:2]
+    q_values = [
+        np.geomspace(engine.q_min, engine.q_max, 32),
+        np.geomspace(engine.q_min, engine.q_max, 48),
+    ]
+    intensities = [np.ones(32), np.full(48, 2.0)]
+
+    engine.update(positions, q_values, intensities)
+
+    assert len(engine.measurements) == 2
+    assert [measurement.q.size for measurement in engine.measurements] == [32, 48]
+    assert refit_calls == [True]
+    with pytest.raises(ValueError, match="already been measured"):
+        engine.update(positions[0], q_values[0], intensities[0])
+
+
+def test_adaptive_suggest_requires_model_update():
+    engine = configure_manager(make_manager())
+
+    with pytest.raises(ValueError, match="suggest_initial_measurements"):
+        engine.suggest()
 
 
 def test_preprocess_spectrum_interpolates_and_subtracts_background(monkeypatch):
@@ -144,7 +239,7 @@ def test_arpls_background_is_not_pulled_to_narrow_peak():
     background = 1.0 + 0.2 * x
     values = background + 3.0 * np.exp(-((x - 0.5) / 0.025) ** 2)
 
-    fitted = SpatialSAXSAdaptiveSamplingTaskManager.fit_arpls_background(
+    fitted = SpatialSAXSAdaptiveSamplingEngineTool.fit_arpls_background(
         values,
         smoothness=1e5,
         max_iterations=50,
@@ -161,7 +256,7 @@ def test_valley_background_interpolates_between_peak_separating_valleys():
         intensity += 2.0 * np.exp(-0.5 * ((x - center) / 0.035) ** 2)
 
     fitted, valley_indices = (
-        SpatialSAXSAdaptiveSamplingTaskManager.fit_valley_background(
+        SpatialSAXSAdaptiveSamplingEngineTool.fit_valley_background(
             np.log(intensity),
             smoothing_sigma=2.0,
             min_prominence=0.05,
@@ -177,7 +272,7 @@ def test_valley_background_interpolates_between_peak_separating_valleys():
 
 def test_valley_background_defers_to_fallback_with_fewer_than_two_valleys():
     fitted, valley_indices = (
-        SpatialSAXSAdaptiveSamplingTaskManager.fit_valley_background(
+        SpatialSAXSAdaptiveSamplingEngineTool.fit_valley_background(
             np.linspace(1.0, 0.0, 64),
             smoothing_sigma=2.0,
             min_prominence=0.05,
@@ -447,7 +542,7 @@ def test_peak_map_score_rejects_uniform_map_and_normalizes_per_peak(monkeypatch)
         torch.zeros_like(predicted_observables)
     )
 
-    assert manager.peak_map_min_concentration == 0.15
+    assert manager.peak_map_min_concentration == 0.2
     np.testing.assert_allclose(
         score.detach().cpu().numpy(),
         localized.detach().cpu().numpy(),
@@ -691,7 +786,7 @@ def test_batch_crossing_exploration_interval_includes_farthest_position():
         acquisition=np.array([3.0, 2.0, 1.0]),
     )
 
-    suggestions = manager.suggest_next_positions(k=2)
+    suggestions = manager.suggest(n_suggestions=2)
 
     assert manager._batch_includes_farthest_exploration(2)
     assert {tuple(position) for position in suggestions} == {
@@ -715,7 +810,7 @@ def test_farthest_position_participates_in_suggestion_exclusion():
         acquisition=np.array([3.0, 2.0, 1.0]),
     )
 
-    suggestions = manager.suggest_next_positions(k=2)
+    suggestions = manager.suggest(n_suggestions=2)
 
     assert {tuple(position) for position in suggestions} == {
         (0.0, 0.0),
@@ -751,7 +846,7 @@ def test_exclusion_radius_filters_adaptive_suggestions():
     manager.gp_model = GPModel()
 
     scores = manager.compute_acquisition_scores()
-    suggestion = manager.suggest_next_positions()
+    suggestion = manager.suggest()
 
     expected_positions = np.array(
         [
@@ -785,7 +880,7 @@ def test_suggestion_exclusion_radius_spaces_multi_candidate_suggestion():
         acquisition=np.array([4.0, 3.0, 2.0, 1.0]),
     )
 
-    suggestions = manager.suggest_next_positions(k=2)
+    suggestions = manager.suggest(n_suggestions=2)
     pairwise_distance = np.linalg.norm(suggestions[0] - suggestions[1])
 
     assert {tuple(position) for position in suggestions} == {
@@ -808,7 +903,7 @@ def test_exclusion_radius_does_not_space_suggestions_from_each_other():
         acquisition=np.array([2.0, 1.0]),
     )
 
-    suggestions = manager.suggest_next_positions(k=2)
+    suggestions = manager.suggest(n_suggestions=2)
 
     assert np.linalg.norm(suggestions[0] - suggestions[1]) == pytest.approx(1.0)
 
@@ -881,7 +976,7 @@ def test_run_collects_unique_measurements():
     )
 
     assert len(manager.measurements) == 4
-    assert len(set(manager.measured_candidate_indices)) == 4
+    assert len(set(manager.engine_tool.measured_candidate_indices)) == 4
     assert manager.latest_scores is not None
 
 
@@ -889,18 +984,33 @@ def test_run_acquires_multiple_candidates_before_refitting():
     manager = make_manager()
     suggestion_sizes = []
     refit_count = 0
+    engine = manager.engine_tool
 
-    def suggest(k=1):
-        suggestion_sizes.append(k)
-        indices = manager.get_unsampled_candidate_indices()[:k]
-        return manager.candidate_positions[indices]
+    def suggest(n_suggestions=1):
+        suggestion_sizes.append(n_suggestions)
+        indices = engine.get_unsampled_candidate_indices()[:n_suggestions]
+        return engine.candidate_positions[indices]
 
-    def refit():
+    def update(positions, q_values, intensities):
         nonlocal refit_count
         refit_count += 1
+        for position, q, intensity in zip(
+            positions, q_values, intensities, strict=True
+        ):
+            candidate_index = engine.get_candidate_index(position)
+            engine.measurements.append(
+                SAXSMeasurement(
+                    position=np.asarray(position),
+                    q=np.asarray(q),
+                    intensity=np.asarray(intensity),
+                    spectrum=np.zeros(engine.num_q_points),
+                    background=np.zeros(engine.num_q_points),
+                )
+            )
+            engine.measured_candidate_indices.append(candidate_index)
 
-    manager.suggest_next_positions = suggest
-    manager.refit_model = refit
+    engine.suggest = suggest
+    engine.update = update
 
     manager.run(
         **default_sampling_kwargs(
@@ -918,7 +1028,7 @@ def test_run_acquires_multiple_candidates_before_refitting():
 def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
     manager = configure_manager(make_manager())
     for candidate_index in range(3):
-        manager.measure_candidate(candidate_index)
+        record_candidate(manager, candidate_index)
 
     calls = []
 
@@ -937,14 +1047,14 @@ def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
 
     monkeypatch.setattr(manager, "fit_gp", fake_fit_gp)
     manager.refit_model()
-    manager.measure_candidate(3)
+    record_candidate(manager, 3)
 
     manager.refit_model()
 
     assert manager.excluded_measurement_indices == {3}
     assert calls[-2:] == [(4, True), (3, False)]
 
-    manager.measure_candidate(4)
+    record_candidate(manager, 4)
     manager.refit_model()
 
     assert calls[-1] == (4, True)
@@ -958,10 +1068,10 @@ def test_fit_gp_creates_independent_component_models_and_configures_iterations(
 
     calls = []
     monkeypatch.setattr(
-        "eaa_aps12id.task_managers.spatial_saxs_sampling.fit_gpytorch_mll",
+        "eaa_aps12id.tools.spatial_saxs_sampling.fit_gpytorch_mll",
         lambda mll, **kwargs: calls.append(kwargs),
     )
-    model = SpatialSAXSAdaptiveSamplingTaskManager.fit_gp(
+    model = SpatialSAXSAdaptiveSamplingEngineTool.fit_gp(
         torch.rand(4, 2, dtype=torch.double),
         torch.rand(4, 2, dtype=torch.double),
         max_fit_gp_mll_iterations=7,
@@ -975,7 +1085,7 @@ def test_fit_gp_creates_independent_component_models_and_configures_iterations(
         {"optimizer_kwargs": {"options": {"maxiter": 7}}},
     ]
 
-    SpatialSAXSAdaptiveSamplingTaskManager.fit_gp(
+    SpatialSAXSAdaptiveSamplingEngineTool.fit_gp(
         torch.rand(4, 2, dtype=torch.double),
         torch.rand(4, 2, dtype=torch.double),
         max_fit_gp_mll_iterations=None,
