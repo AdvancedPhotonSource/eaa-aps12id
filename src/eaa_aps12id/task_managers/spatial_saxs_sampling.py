@@ -6,6 +6,7 @@ from typing import Any, Literal, Optional
 
 import eaa_core.matplotlib_setup  # noqa: F401
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import torch
 from botorch.fit import fit_gpytorch_mll
@@ -143,6 +144,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.num_initial_samples: int | None = None
         self.max_measurements: int | None = None
         self.exclusion_radius: float | None = None
+        self.suggestion_exclusion_radius: float | None = None
+        self.num_candidates_per_suggestion = 1
         self.background_smoothness: float | None = None
         self.background_max_iterations: int | None = None
         self.background_tolerance: float | None = None
@@ -232,6 +235,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         num_initial_samples: int = 5,
         max_measurements: int = 20,
         exclusion_radius: float | None = None,
+        suggestion_exclusion_radius: float | None = None,
         background_smoothness: float = 1e6,
         background_max_iterations: int = 50,
         background_tolerance: float = 1e-3,
@@ -285,6 +289,11 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 None
                 if exclusion_radius is None
                 else float(exclusion_radius)
+            ),
+            "suggestion_exclusion_radius": (
+                None
+                if suggestion_exclusion_radius is None
+                else float(suggestion_exclusion_radius)
             ),
             "background_smoothness": float(background_smoothness),
             "background_max_iterations": int(background_max_iterations),
@@ -369,6 +378,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.num_initial_samples = config["num_initial_samples"]
         self.max_measurements = config["max_measurements"]
         self.exclusion_radius = config["exclusion_radius"]
+        self.suggestion_exclusion_radius = config[
+            "suggestion_exclusion_radius"
+        ]
         self.background_smoothness = config["background_smoothness"]
         self.background_max_iterations = config["background_max_iterations"]
         self.background_tolerance = config["background_tolerance"]
@@ -453,6 +465,14 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ):
             raise ValueError(
                 "`exclusion_radius` must be finite and nonnegative or None."
+            )
+        if self.suggestion_exclusion_radius is not None and (
+            not np.isfinite(self.suggestion_exclusion_radius)
+            or self.suggestion_exclusion_radius < 0
+        ):
+            raise ValueError(
+                "`suggestion_exclusion_radius` must be finite and nonnegative "
+                "or None."
             )
         if self.background_smoothness <= 0:
             raise ValueError("`background_smoothness` must be positive.")
@@ -637,6 +657,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         random_seed: int | None = None,
         n_iterations: int | None = None,
         non_position_kwargs_for_acquisition_tool: dict[str, Any] | None = None,
+        suggestion_exclusion_radius: float | None = None,
+        num_candidates_per_suggestion: int = 1,
         *args,
         **kwargs,
     ) -> None:
@@ -718,8 +740,10 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Fixed scale used by the ``log1p`` GP target transform. This
             parameter is also used when ``peak_observable="height"``.
         exploration_interval : int, optional
-            Select the farthest unsampled position on every Nth adaptive step.
-            When omitted, do not schedule farthest-point exploration.
+            Include a farthest unsampled position on every Nth adaptive
+            measurement. A multi-candidate suggestion containing a scheduled
+            measurement includes one farthest position. When omitted, do not
+            schedule farthest-point exploration.
         max_fit_gp_mll_iterations : int, optional
             Maximum optimizer iterations for GP marginal likelihood fitting.
             When omitted, do not impose an iteration limit.
@@ -747,8 +771,24 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             Keyword arguments other than ``x`` and ``y`` to pass through to the
             acquisition tool's ``acquire_saxs`` method. When omitted, ``q_min``
             and ``q_max`` from this manager are used.
+        suggestion_exclusion_radius : float, optional
+            Minimum spacing between positions returned in the same suggestion,
+            in physical ``(x, y)`` coordinates. Candidates on the radius
+            boundary are excluded. This also controls spacing among the
+            initial Sobol positions.
+        num_candidates_per_suggestion : int
+            Number of positions to select and acquire before refitting the
+            model. The final suggestion is shortened to fit the remaining
+            measurement budget.
         """
         del args, kwargs
+        if (
+            isinstance(num_candidates_per_suggestion, (bool, np.bool_))
+            or not isinstance(num_candidates_per_suggestion, (int, np.integer))
+            or num_candidates_per_suggestion < 1
+        ):
+            raise ValueError("`num_candidates_per_suggestion` must be positive.")
+        self.num_candidates_per_suggestion = int(num_candidates_per_suggestion)
         self._configure_sampling_run(
             x_values=x_values,
             y_values=y_values,
@@ -759,6 +799,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             num_initial_samples=num_initial_samples,
             max_measurements=max_measurements,
             exclusion_radius=exclusion_radius,
+            suggestion_exclusion_radius=suggestion_exclusion_radius,
             background_smoothness=background_smoothness,
             background_max_iterations=background_max_iterations,
             background_tolerance=background_tolerance,
@@ -813,14 +854,21 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         n_steps = remaining_budget if n_iterations is None else min(
             int(n_iterations), remaining_budget
         )
-        for _ in range(n_steps):
-            position = self.suggest_next_positions(k=1)[0]
-            candidate_index = self.get_candidate_index(position)
-            self._record_progress_message(
-                "Selected next SAXS position "
-                f"x={position[0]:.6g}, y={position[1]:.6g}."
+        completed_steps = 0
+        while completed_steps < n_steps:
+            suggestion_size = min(
+                self.num_candidates_per_suggestion,
+                n_steps - completed_steps,
             )
-            self.measure_candidate(candidate_index, acquisition_kwargs)
+            positions = self.suggest_next_positions(k=suggestion_size)
+            for position in positions:
+                candidate_index = self.get_candidate_index(position)
+                self._record_progress_message(
+                    "Selected next SAXS position "
+                    f"x={position[0]:.6g}, y={position[1]:.6g}."
+                )
+                self.measure_candidate(candidate_index, acquisition_kwargs)
+                completed_steps += 1
             self.refit_model()
             if len(self.measurements) >= self.max_measurements:
                 break
@@ -848,7 +896,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self._record_progress_message(
             f"Collecting {self.num_initial_samples} initial SAXS measurements."
         )
-        for candidate_index in self.get_initial_candidate_indices():
+        candidate_indices = self.get_initial_candidate_indices()
+        positions = self._optimize_suggestion_path(
+            self.candidate_positions[candidate_indices]
+        )
+        for position in positions:
+            candidate_index = self.get_candidate_index(position)
             self.measure_candidate(candidate_index, acquisition_kwargs)
         self.refit_model()
 
@@ -875,9 +928,15 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             nearest = torch.argmin(distances, dim=1).detach().cpu().numpy()
             for idx in nearest:
                 idx_int = int(idx)
-                eligible = self._filter_candidate_indices_by_exclusion(
+                eligible = self._filter_candidate_indices_by_radius(
                     np.asarray([idx_int], dtype=int),
-                    [*self.measured_candidate_indices, *selected],
+                    self.measured_candidate_indices,
+                    self.exclusion_radius,
+                )
+                eligible = self._filter_candidate_indices_by_radius(
+                    eligible,
+                    selected,
+                    self.suggestion_exclusion_radius,
                 )
                 if idx_int not in selected_set and eligible.size:
                     selected.append(idx_int)
@@ -887,9 +946,15 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             max_draws *= 2
 
         for idx in range(self.candidate_positions.shape[0]):
-            eligible = self._filter_candidate_indices_by_exclusion(
+            eligible = self._filter_candidate_indices_by_radius(
                 np.asarray([idx], dtype=int),
-                [*self.measured_candidate_indices, *selected],
+                self.measured_candidate_indices,
+                self.exclusion_radius,
+            )
+            eligible = self._filter_candidate_indices_by_radius(
+                eligible,
+                selected,
+                self.suggestion_exclusion_radius,
             )
             if idx not in selected_set and eligible.size:
                 selected.append(idx)
@@ -898,8 +963,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                     break
         if len(selected) < self.num_initial_samples:
             raise ValueError(
-                "`exclusion_radius` leaves fewer than `num_initial_samples` "
-                "eligible candidate positions."
+                "The configured exclusion radii leave fewer than "
+                "`num_initial_samples` eligible candidate positions."
             )
         return selected
 
@@ -1999,8 +2064,21 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         reference_indices: list[int],
     ) -> np.ndarray:
         """Remove candidates inside the exclusion radius of references."""
+        return self._filter_candidate_indices_by_radius(
+            candidate_indices,
+            reference_indices,
+            self.exclusion_radius,
+        )
+
+    def _filter_candidate_indices_by_radius(
+        self,
+        candidate_indices: np.ndarray,
+        reference_indices: list[int],
+        exclusion_radius: float | None,
+    ) -> np.ndarray:
+        """Remove candidates within a physical radius of references."""
         candidate_indices = np.asarray(candidate_indices, dtype=int)
-        if self.exclusion_radius is None or not reference_indices:
+        if exclusion_radius is None or not reference_indices:
             return candidate_indices
         candidate_positions = self.candidate_positions[candidate_indices]
         reference_positions = self.candidate_positions[reference_indices]
@@ -2009,7 +2087,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             - reference_positions[None, :, :],
             axis=-1,
         ).min(axis=1)
-        return candidate_indices[minimum_distances > self.exclusion_radius]
+        return candidate_indices[minimum_distances > exclusion_radius]
 
     def get_eligible_candidate_indices(self) -> np.ndarray:
         """Return unsampled candidates outside measured-point exclusions."""
@@ -2019,32 +2097,96 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         )
 
     def suggest_next_positions(self, k: int = 1) -> np.ndarray:
-        """Return the current top-k eligible candidate positions."""
+        """Return spaced, travel-optimized top-k eligible positions."""
         self._require_sampling_configured()
         if k < 1:
             raise ValueError("`k` must be positive.")
         if self.gp_model is None:
             if not self.measurements:
                 indices = self.get_initial_candidate_indices()[:k]
-                return self.candidate_positions[indices].copy()
+                positions = self.candidate_positions[indices].copy()
+                return self._optimize_suggestion_path(positions)
             self.refit_model()
-        if k == 1 and self._is_farthest_exploration_step():
+        include_farthest = self._batch_includes_farthest_exploration(k)
+        if k == 1 and include_farthest:
             return self.get_farthest_unsampled_position()[None, :]
         scores = self.compute_acquisition_scores()
         if k > scores.positions.shape[0]:
             raise ValueError("`k` cannot exceed the number of eligible candidates.")
         order = np.argsort(-scores.acquisition, kind="stable")
-        return scores.positions[order[:k]].copy()
+        selected: list[np.ndarray] = []
+        if include_farthest:
+            selected.append(self.get_farthest_unsampled_position())
+        for index in order:
+            position = scores.positions[index]
+            if selected and any(
+                np.all(np.isclose(position, selected_position))
+                for selected_position in selected
+            ):
+                continue
+            if selected and self.suggestion_exclusion_radius is not None:
+                distances = np.linalg.norm(
+                    np.asarray(selected) - position,
+                    axis=1,
+                )
+                if np.any(distances <= self.suggestion_exclusion_radius):
+                    continue
+            selected.append(position)
+            if len(selected) == k:
+                break
+        if len(selected) < k:
+            raise ValueError(
+                "`suggestion_exclusion_radius` leaves fewer than `k` "
+                "eligible suggestions."
+            )
+        return self._optimize_suggestion_path(np.asarray(selected))
+
+    def _optimize_suggestion_path(self, positions: np.ndarray) -> np.ndarray:
+        """Order positions with a low-overhead greedy TSP approximation."""
+        positions = np.asarray(positions, dtype=float)
+        if positions.shape[0] < 2:
+            return positions.copy()
+
+        graph = nx.complete_graph(positions.shape[0])
+        for left, right in graph.edges:
+            graph[left][right]["weight"] = float(
+                np.linalg.norm(positions[left] - positions[right])
+            )
+
+        if self.measured_candidate_indices:
+            start_node = positions.shape[0]
+            graph.add_node(start_node)
+            start_position = self.candidate_positions[
+                self.measured_candidate_indices[-1]
+            ]
+            for index, position in enumerate(positions):
+                graph.add_edge(
+                    start_node,
+                    index,
+                    weight=float(np.linalg.norm(start_position - position)),
+                )
+            route = nx.approximation.greedy_tsp(graph, source=start_node)[1:-1]
+        else:
+            route = nx.approximation.greedy_tsp(graph, source=0)[:-1]
+        return positions[route].copy()
 
     def _is_farthest_exploration_step(self) -> bool:
-        """Return whether the next adaptive step is scheduled for exploration."""
+        """Return whether the next adaptive measurement uses exploration."""
+        return self._batch_includes_farthest_exploration(1)
+
+    def _batch_includes_farthest_exploration(self, k: int) -> bool:
+        """Return whether a batch spans a scheduled exploration measurement."""
         if self.exploration_interval is None:
             return False
         adaptive_measurements = max(
             len(self.measurements) - self.num_initial_samples,
             0,
         )
-        return (adaptive_measurements + 1) % self.exploration_interval == 0
+        completed_intervals = adaptive_measurements // self.exploration_interval
+        completed_intervals_after_batch = (
+            adaptive_measurements + k
+        ) // self.exploration_interval
+        return completed_intervals_after_batch > completed_intervals
 
     def get_farthest_unsampled_position(self) -> np.ndarray:
         """Return the eligible position farthest from all measured positions."""

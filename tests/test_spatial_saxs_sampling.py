@@ -120,10 +120,10 @@ def test_initial_sobol_selection_is_unique_and_deterministic():
     assert len(set(indices_a)) == manager_a.num_initial_samples
 
 
-def test_initial_selection_respects_exclusion_radius():
+def test_initial_selection_respects_suggestion_exclusion_radius():
     manager = configure_manager(
         make_manager(),
-        exclusion_radius=1.01,
+        suggestion_exclusion_radius=1.01,
     )
 
     indices = manager.get_initial_candidate_indices()
@@ -135,7 +135,7 @@ def test_initial_selection_respects_exclusion_radius():
 
     assert np.all(
         pairwise_distances[np.triu_indices(len(indices), k=1)]
-        >= manager.exclusion_radius
+        > manager.suggestion_exclusion_radius
     )
 
 
@@ -677,6 +677,52 @@ def test_scheduled_exploration_selects_farthest_unsampled_position():
     )
 
 
+def test_batch_crossing_exploration_interval_includes_farthest_position():
+    manager = configure_manager(
+        make_manager(),
+        num_initial_samples=1,
+        exploration_interval=5,
+    )
+    manager.measurements = [SimpleNamespace() for _ in range(4)]
+    manager.measured_candidate_indices = [4]
+    manager.gp_model = object()
+    manager.compute_acquisition_scores = lambda: SimpleNamespace(
+        positions=np.array([[2.0, 2.0], [2.0, 1.0], [0.0, 2.0]]),
+        acquisition=np.array([3.0, 2.0, 1.0]),
+    )
+
+    suggestions = manager.suggest_next_positions(k=2)
+
+    assert manager._batch_includes_farthest_exploration(2)
+    assert {tuple(position) for position in suggestions} == {
+        (0.0, 0.0),
+        (2.0, 2.0),
+    }
+
+
+def test_farthest_position_participates_in_suggestion_exclusion():
+    manager = configure_manager(
+        make_manager(),
+        num_initial_samples=1,
+        exploration_interval=5,
+        suggestion_exclusion_radius=1.01,
+    )
+    manager.measurements = [SimpleNamespace() for _ in range(4)]
+    manager.measured_candidate_indices = [4]
+    manager.gp_model = object()
+    manager.compute_acquisition_scores = lambda: SimpleNamespace(
+        positions=np.array([[0.0, 1.0], [2.0, 2.0], [2.0, 1.0]]),
+        acquisition=np.array([3.0, 2.0, 1.0]),
+    )
+
+    suggestions = manager.suggest_next_positions(k=2)
+
+    assert {tuple(position) for position in suggestions} == {
+        (0.0, 0.0),
+        (2.0, 2.0),
+    }
+
+
 def test_exclusion_radius_filters_adaptive_suggestions():
     manager = configure_manager(
         make_manager(),
@@ -717,6 +763,67 @@ def test_exclusion_radius_filters_adaptive_suggestions():
     )
     np.testing.assert_array_equal(scores.positions, expected_positions)
     assert np.linalg.norm(suggestion[0] - np.array([1.0, 1.0])) >= 1.01
+
+
+def test_suggestion_exclusion_radius_spaces_multi_candidate_suggestion():
+    manager = configure_manager(
+        make_manager(),
+        suggestion_exclusion_radius=1.01,
+    )
+    manager.measurements = [SimpleNamespace()]
+    manager.measured_candidate_indices = [0]
+    manager.gp_model = object()
+    manager.compute_acquisition_scores = lambda: SimpleNamespace(
+        positions=np.array(
+            [
+                [2.0, 2.0],
+                [2.0, 1.0],
+                [0.0, 2.0],
+                [1.0, 0.0],
+            ]
+        ),
+        acquisition=np.array([4.0, 3.0, 2.0, 1.0]),
+    )
+
+    suggestions = manager.suggest_next_positions(k=2)
+    pairwise_distance = np.linalg.norm(suggestions[0] - suggestions[1])
+
+    assert {tuple(position) for position in suggestions} == {
+        (2.0, 2.0),
+        (0.0, 2.0),
+    }
+    assert pairwise_distance > manager.suggestion_exclusion_radius
+
+
+def test_exclusion_radius_does_not_space_suggestions_from_each_other():
+    manager = configure_manager(
+        make_manager(),
+        exclusion_radius=1.01,
+    )
+    manager.measurements = [SimpleNamespace()]
+    manager.measured_candidate_indices = [0]
+    manager.gp_model = object()
+    manager.compute_acquisition_scores = lambda: SimpleNamespace(
+        positions=np.array([[2.0, 2.0], [2.0, 1.0]]),
+        acquisition=np.array([2.0, 1.0]),
+    )
+
+    suggestions = manager.suggest_next_positions(k=2)
+
+    assert np.linalg.norm(suggestions[0] - suggestions[1]) == pytest.approx(1.0)
+
+
+def test_multi_candidate_suggestions_are_ordered_for_short_travel():
+    manager = configure_manager(make_manager())
+    manager.measured_candidate_indices = [0]
+    positions = np.array([[10.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+
+    ordered = manager._optimize_suggestion_path(positions)
+
+    np.testing.assert_array_equal(
+        ordered,
+        np.array([[1.0, 0.0], [2.0, 0.0], [10.0, 0.0]]),
+    )
 
 
 def test_exclusion_radius_excludes_candidate_on_boundary():
@@ -776,6 +883,36 @@ def test_run_collects_unique_measurements():
     assert len(manager.measurements) == 4
     assert len(set(manager.measured_candidate_indices)) == 4
     assert manager.latest_scores is not None
+
+
+def test_run_acquires_multiple_candidates_before_refitting():
+    manager = make_manager()
+    suggestion_sizes = []
+    refit_count = 0
+
+    def suggest(k=1):
+        suggestion_sizes.append(k)
+        indices = manager.get_unsampled_candidate_indices()[:k]
+        return manager.candidate_positions[indices]
+
+    def refit():
+        nonlocal refit_count
+        refit_count += 1
+
+    manager.suggest_next_positions = suggest
+    manager.refit_model = refit
+
+    manager.run(
+        **default_sampling_kwargs(
+            num_q_points=64,
+            max_measurements=7,
+        ),
+        num_candidates_per_suggestion=3,
+    )
+
+    assert suggestion_sizes == [3, 1]
+    assert refit_count == 3
+    assert len(manager.measurements) == 7
 
 
 def test_refit_excludes_measurement_when_mll_prior_sampling_fails(monkeypatch):
@@ -906,6 +1043,19 @@ def test_configure_rejects_invalid_known_peak_q_values(
 def test_configure_rejects_negative_exclusion_radius():
     with pytest.raises(ValueError, match="`exclusion_radius`"):
         configure_manager(make_manager(), exclusion_radius=-0.1)
+
+
+def test_configure_rejects_negative_suggestion_exclusion_radius():
+    with pytest.raises(ValueError, match="`suggestion_exclusion_radius`"):
+        configure_manager(make_manager(), suggestion_exclusion_radius=-0.1)
+
+
+def test_run_rejects_invalid_num_candidates_per_suggestion():
+    with pytest.raises(ValueError, match="`num_candidates_per_suggestion`"):
+        make_manager().run(
+            **default_sampling_kwargs(),
+            num_candidates_per_suggestion=0,
+        )
 
 
 def test_configure_rejects_negative_new_peak_relative_area():
