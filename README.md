@@ -39,7 +39,7 @@ the `engine_tool` constructor argument.
 
 Calling `run(...)` performs the following loop:
 
-1. Initialize the engine with the candidate mesh and active-learning configuration.
+1. Initialize the engine with the candidate positions and active-learning configuration.
 2. Ask the engine for path-optimized initial positions.
 3. Acquire the initial SAXS spectra and update the engine once with the complete batch.
 4. Ask the engine for the next path-optimized batch, acquire it, and update the engine.
@@ -54,9 +54,9 @@ logic. It never collects data and has no acquisition backend.
 
 Its exposed interface is:
 
-- `initialize(...)`: configure the candidate mesh, preprocessing, peak-detection, GP,
+- `initialize(...)`: configure the candidate positions, preprocessing, peak-detection, GP,
   and acquisition parameters.
-- `suggest_initial_measurements()`: select initial mesh positions with scrambled Sobol
+- `suggest_initial_measurements()`: select initial candidate positions with scrambled Sobol
   sampling and return them in a travel-optimized order.
 - `update(positions, q_values, intensities)`: preprocess one or more new spectra,
   update the peak dictionary, and refit the GP models once for the batch.
@@ -107,8 +107,12 @@ from eaa_aps12id.tools import SpatialSAXSAdaptiveSamplingEngineTool
 
 engine = SpatialSAXSAdaptiveSamplingEngineTool()
 engine.initialize(
-    x_values=[0.0, 1.0, 2.0],
-    y_values=[0.0, 1.0, 2.0],
+    candidate_positions=[
+        [0.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+    ],
 )
 
 positions = engine.suggest_initial_measurements()
@@ -123,7 +127,8 @@ while more_measurements_are_needed():
 
 `q_values` and `intensities` may contain arrays of different lengths for different
 measurements. Each update must also include the corresponding spatial positions from
-the configured candidate mesh.
+the configured candidate set. Candidate-position columns are ordered ``(y, x)``;
+coordinates otherwise use the same unit and frame as the acquisition tool.
 
 ## Acquisition tools
 

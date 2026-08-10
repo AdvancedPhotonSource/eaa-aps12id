@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from eaa_core.gui.runtime import WebUIRuntimeController
 from eaa_core.tool.base import BaseTool
-from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d
 
 from eaa_aps12id.task_managers.spatial_saxs_sampling import (
     SpatialSAXSAdaptiveSamplingTaskManager,
@@ -47,8 +47,17 @@ class DummySAXSTool(BaseTool):
 
 def default_sampling_kwargs(**kwargs):
     params = {
-        "x_values": [0.0, 1.0, 2.0],
-        "y_values": [0.0, 1.0, 2.0],
+        "candidate_positions": [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 2.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+        ],
         "q_min": 0.01,
         "q_max": 1.0,
         "num_q_points": 16,
@@ -87,8 +96,8 @@ def record_candidate(engine, candidate_index):
     """Record a dummy spectrum without triggering an engine refit."""
     position = engine.candidate_positions[candidate_index]
     q, intensity = DummySAXSTool().acquire_saxs(
-        x=float(position[0]),
-        y=float(position[1]),
+        x=float(position[1]),
+        y=float(position[0]),
         q_min=engine.q_min,
         q_max=engine.q_max,
     )
@@ -572,28 +581,46 @@ def test_peak_map_score_is_zero_when_all_maps_are_uniform(monkeypatch):
 
 
 def test_peak_observable_map_blur_uses_physical_axis_units():
+    candidate_positions = np.array(
+        [
+            [0.0, 0.0],
+            [0.0, 2.0],
+            [0.5, 0.0],
+            [0.5, 2.0],
+            [1.0, 4.0],
+        ]
+    )
     manager = configure_manager(
         make_manager(),
-        x_values=[0.0, 2.0, 4.0],
-        y_values=[0.0, 0.5, 1.0],
+        candidate_positions=candidate_positions,
         peak_observale_map_blur=1.0,
     )
 
     import torch
 
-    observables = torch.zeros(9, 1, dtype=torch.double)
-    observables[4, 0] = 1.0
+    observables = torch.zeros(5, 1, dtype=torch.double)
+    observables[2, 0] = 1.0
 
     blurred = manager.blur_peak_observable_maps(observables)
 
-    expected = gaussian_filter(
-        observables.numpy().reshape(3, 3, 1),
-        sigma=(2.0, 0.5, 0.0),
+    squared_distances = np.sum(
+        (candidate_positions[:, None] - candidate_positions[None, :]) ** 2,
+        axis=-1,
     )
+    weights = np.exp(-squared_distances / 2.0)
+    weights[squared_distances > 4.0**2] = 0.0
+    weights /= weights.sum(axis=1, keepdims=True)
+    expected = weights @ observables.numpy()
     np.testing.assert_allclose(
         blurred.detach().cpu().numpy(),
-        expected.reshape(9, 1),
+        expected,
     )
+    cached_weight_matrix = manager._peak_blur_weight_matrix
+
+    manager.blur_peak_observable_maps(observables)
+
+    assert manager._peak_blur_weight_matrix is cached_weight_matrix
+    assert cached_weight_matrix._nnz() < candidate_positions.shape[0] ** 2
 
 
 def test_peak_height_observable_is_maximum_in_frozen_interval():
@@ -851,8 +878,8 @@ def test_exclusion_radius_filters_adaptive_suggestions():
     expected_positions = np.array(
         [
             [0.0, 0.0],
-            [2.0, 0.0],
             [0.0, 2.0],
+            [2.0, 0.0],
             [2.0, 2.0],
         ]
     )
@@ -1121,12 +1148,36 @@ def test_configure_rejects_invalid_peak_observable_map_blur(
         )
 
 
-def test_configure_rejects_peak_observable_map_blur_on_uneven_grid():
-    with pytest.raises(ValueError, match="evenly spaced"):
+def test_configure_accepts_irregular_candidate_positions():
+    candidate_positions = np.array([[0.0, 0.0], [0.2, 1.0], [1.0, 0.3], [2.0, 3.0]])
+
+    engine = configure_manager(
+        make_manager(),
+        candidate_positions=candidate_positions,
+        peak_observale_map_blur=1.0,
+        num_initial_samples=3,
+    )
+
+    np.testing.assert_array_equal(engine.candidate_positions, candidate_positions)
+
+
+@pytest.mark.parametrize(
+    ("candidate_positions", "message"),
+    [
+        ([], r"shape \(N, 2\)"),
+        ([[0.0, 0.0, 1.0]], r"shape \(N, 2\)"),
+        ([[0.0, np.nan], [1.0, 1.0]], "finite"),
+        ([[0.0, 0.0], [0.0, 0.0]], "duplicates"),
+    ],
+)
+def test_configure_rejects_invalid_candidate_positions(
+    candidate_positions,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
         configure_manager(
             make_manager(),
-            x_values=[0.0, 1.0, 3.0],
-            peak_observale_map_blur=1.0,
+            candidate_positions=candidate_positions,
         )
 
 
@@ -1241,6 +1292,15 @@ def test_run_forwards_non_position_acquisition_kwargs():
     assert manager.acquisition_tool.calls
     assert all(call["q_step"] == 0.001 for call in manager.acquisition_tool.calls)
     assert all(call["exposure"] == 0.5 for call in manager.acquisition_tool.calls)
+    for call, measurement in zip(
+        manager.acquisition_tool.calls,
+        manager.measurements,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            measurement.position,
+            [call["y"], call["x"]],
+        )
 
 
 def test_run_publishes_webui_progress_and_posterior_tile(tmp_path):

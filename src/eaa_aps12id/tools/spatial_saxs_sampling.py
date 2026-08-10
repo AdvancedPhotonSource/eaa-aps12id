@@ -13,10 +13,11 @@ from eaa_core.tool.base import BaseTool, tool
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from scipy.interpolate import PchipInterpolator
-from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class AcquisitionScores:
 class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
     """Bayesian active-learning engine for spatially resolved SAXS.
 
-    The engine models spectra measured on a finite spatial mesh, preprocesses each
+    The engine models spectra measured at finite spatial candidates, preprocesses each
     ``(q, I)`` SAXS spectrum onto a common log-spaced q grid, subtracts a
     smooth background, and uses independent GP models for detected peak areas
     or heights to choose additional measurement positions.
@@ -101,8 +102,6 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
                 "and gpytorch. Install this package with its declared dependencies."
             )
         self._sampling_config: dict[str, Any] | None = None
-        self.x_values: np.ndarray | None = None
-        self.y_values: np.ndarray | None = None
         self.candidate_positions: np.ndarray | None = None
         self.q_min: float | None = None
         self.q_max: float | None = None
@@ -157,6 +156,9 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         self.modeled_peak_ids: list[int] = []
         self.gp_model = None
         self.latest_scores: AcquisitionScores | None = None
+        self._peak_blur_indices: np.ndarray | None = None
+        self._peak_blur_weights: np.ndarray | None = None
+        self._peak_blur_weight_matrix: torch.Tensor | None = None
         super().__init__(
             *args,
             build=False,
@@ -165,30 +167,29 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         )
 
     @staticmethod
-    def _validate_axis_values(values: Any, name: str) -> np.ndarray:
+    def _validate_candidate_positions(values: Any) -> np.ndarray:
         if values is None:
-            raise ValueError(f"`{name}` must be provided.")
-        axis = np.asarray(values, dtype=float).reshape(-1)
-        if axis.size < 2:
-            raise ValueError(f"`{name}` must contain at least two values.")
-        if not np.all(np.isfinite(axis)):
-            raise ValueError(f"`{name}` must contain only finite values.")
-        if np.unique(axis).size != axis.size:
-            raise ValueError(f"`{name}` must not contain duplicates.")
-        return axis
-
-    @staticmethod
-    def _build_candidate_positions(
-        x_values: np.ndarray, y_values: np.ndarray
-    ) -> np.ndarray:
-        x_grid, y_grid = np.meshgrid(x_values, y_values, indexing="xy")
-        return np.column_stack([x_grid.ravel(), y_grid.ravel()])
+            raise ValueError("`candidate_positions` must be provided.")
+        positions = np.asarray(values, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] != 2 or not positions.shape[0]:
+            raise ValueError(
+                "`candidate_positions` must be a non-empty array with shape (N, 2)."
+            )
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("`candidate_positions` must contain only finite values.")
+        if np.unique(positions, axis=0).shape[0] != positions.shape[0]:
+            raise ValueError("`candidate_positions` must not contain duplicates.")
+        return positions
 
     @tool(name="spatial_saxs_adaptive_sampling_engine.initialize")
     def initialize(
         self,
-        x_values: np.ndarray | list[float] | tuple[float, ...],
-        y_values: np.ndarray | list[float] | tuple[float, ...],
+        candidate_positions: (
+            np.ndarray
+            | list[list[float]]
+            | list[tuple[float, float]]
+            | tuple[tuple[float, float], ...]
+        ),
         q_min: float = 0.001,
         q_max: float = 1.0,
         num_q_points: int = 256,
@@ -228,17 +229,22 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         normalization_upper_percentile: float = 95.0,
         random_seed: int | None = None,
     ) -> None:
-        """Configure the active-learning engine for one sampling run."""
-        x_axis = self._validate_axis_values(x_values, "x_values")
-        y_axis = self._validate_axis_values(y_values, "y_values")
+        """Configure the active-learning engine for one sampling run.
+
+        Parameters
+        ----------
+        candidate_positions : array-like
+            Candidate spatial coordinates with shape ``(N, 2)``. Columns are
+            ordered ``(y, x)`` and rows retain the supplied order.
+        """
+        candidates = self._validate_candidate_positions(candidate_positions)
         known_peaks = (
             None
             if known_peak_q_values is None
             else np.asarray(known_peak_q_values, dtype=float).reshape(-1)
         )
         config = {
-            "x_values": tuple(x_axis.tolist()),
-            "y_values": tuple(y_axis.tolist()),
+            "candidate_positions": tuple(map(tuple, candidates.tolist())),
             "q_min": float(q_min),
             "q_max": float(q_max),
             "num_q_points": int(num_q_points),
@@ -307,11 +313,7 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
             return
 
         self._sampling_config = config
-        self.x_values = x_axis
-        self.y_values = y_axis
-        self.candidate_positions = self._build_candidate_positions(
-            self.x_values, self.y_values
-        )
+        self.candidate_positions = candidates.copy()
         self.q_min = config["q_min"]
         self.q_max = config["q_max"]
         self.num_q_points = config["num_q_points"]
@@ -358,9 +360,11 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         self.position_min = self.candidate_positions.min(axis=0)
         self.position_max = self.candidate_positions.max(axis=0)
         self.position_span = self.position_max - self.position_min
+        self.position_span[self.position_span == 0] = 1.0
         self.candidate_positions_normalized = self.normalize_positions(
             self.candidate_positions
         )
+        self._build_peak_blur_weights()
 
     def _require_sampling_configured(self) -> None:
         """Raise if adaptive sampling parameters have not been configured."""
@@ -464,19 +468,6 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
             raise ValueError(
                 "`peak_observale_map_blur` must be finite and nonnegative or None."
             )
-        if self.peak_observale_map_blur and (
-            not np.allclose(
-                np.abs(np.diff(self.x_values)),
-                np.abs(np.diff(self.x_values))[0],
-            )
-            or not np.allclose(
-                np.abs(np.diff(self.y_values)),
-                np.abs(np.diff(self.y_values))[0],
-            )
-        ):
-            raise ValueError(
-                "`peak_observale_map_blur` requires evenly spaced x and y values."
-            )
         if self.peak_area_scale <= 0:
             raise ValueError("`peak_area_scale` must be positive.")
         if self.exploration_interval is not None and self.exploration_interval < 1:
@@ -513,7 +504,7 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         )
 
     def normalize_positions(self, positions: np.ndarray) -> np.ndarray:
-        """Normalize positions to the full candidate-grid bounds."""
+        """Normalize positions to the full candidate-coordinate bounds."""
         self._require_sampling_configured()
         positions = np.asarray(positions, dtype=float)
         return (positions - self.position_min) / self.position_span
@@ -1751,7 +1742,10 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         self,
         observables: torch.Tensor,
     ) -> torch.Tensor:
-        """Blur peak-observable maps using a physical spatial width.
+        """Blur peak-observable maps using a truncated physical spatial width.
+
+        Candidate contributions beyond four blur widths are omitted. The
+        normalized sparse weight matrix is cached for repeated calls.
 
         Parameters
         ----------
@@ -1767,32 +1761,60 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         if not self.peak_observale_map_blur:
             return observables
 
-        x_spacing = np.abs(np.diff(self.x_values))
-        y_spacing = np.abs(np.diff(self.y_values))
-
-        observable_maps = (
-            observables.detach()
-            .cpu()
-            .numpy()
-            .reshape(
-                len(self.y_values),
-                len(self.x_values),
-                -1,
+        weight_matrix = self._peak_blur_weight_matrix
+        if (
+            weight_matrix is None
+            or weight_matrix.dtype != observables.dtype
+            or weight_matrix.device != observables.device
+        ):
+            weight_matrix = torch.sparse_coo_tensor(
+                torch.as_tensor(
+                    self._peak_blur_indices,
+                    dtype=torch.long,
+                    device=observables.device,
+                ),
+                torch.as_tensor(
+                    self._peak_blur_weights,
+                    dtype=observables.dtype,
+                    device=observables.device,
+                ),
+                size=(self.candidate_positions.shape[0],) * 2,
+                dtype=observables.dtype,
+                device=observables.device,
+                is_coalesced=True,
+                check_invariants=False,
             )
+            self._peak_blur_weight_matrix = weight_matrix
+        return torch.sparse.mm(weight_matrix, observables)
+
+    def _build_peak_blur_weights(self) -> None:
+        """Build a normalized sparse Gaussian kernel for candidate positions."""
+        self._peak_blur_indices = None
+        self._peak_blur_weights = None
+        self._peak_blur_weight_matrix = None
+        if not self.peak_observale_map_blur:
+            return
+
+        positions = self.candidate_positions
+        blur_width = self.peak_observale_map_blur
+        position_tree = cKDTree(positions)
+        distances = position_tree.sparse_distance_matrix(
+            position_tree,
+            max_distance=4.0 * blur_width,
+            output_type="coo_matrix",
         )
-        blurred = gaussian_filter(
-            observable_maps,
-            sigma=(
-                self.peak_observale_map_blur / y_spacing[0],
-                self.peak_observale_map_blur / x_spacing[0],
-                0.0,
-            ),
+        weights = np.exp(-0.5 * (distances.data / blur_width) ** 2)
+        row_sums = np.bincount(
+            distances.row,
+            weights=weights,
+            minlength=positions.shape[0],
         )
-        return torch.as_tensor(
-            blurred.reshape(observables.shape),
-            dtype=observables.dtype,
-            device=observables.device,
+        weights /= row_sums[distances.row]
+        order = np.lexsort((distances.col, distances.row))
+        self._peak_blur_indices = np.stack(
+            (distances.row[order], distances.col[order])
         )
+        self._peak_blur_weights = weights[order]
 
     def compute_peak_gradient_magnitude(
         self,
@@ -1829,7 +1851,7 @@ class SpatialSAXSAdaptiveSamplingEngineTool(BaseTool):
         return (clipped - lower) / (upper - lower + self.epsilon_normalization)
 
     def get_candidate_index(self, position: np.ndarray) -> int:
-        """Return the exact candidate index for a mesh position."""
+        """Return the exact candidate index for a configured position."""
         self._require_sampling_configured()
         position = np.asarray(position, dtype=float).reshape(1, 2)
         matches = np.where(

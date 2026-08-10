@@ -46,9 +46,13 @@ def main() -> None:
     )
     print("WebUI: http://127.0.0.1:8008")
     try:
+        x_grid, y_grid = np.meshgrid(
+            np.linspace(-1.5, 1.5, 60),
+            np.linspace(-1.9, -1.3, 12),
+            indexing="xy",
+        )
         task_manager.run(
-            x_values=np.linspace(-1.5, 1.5, 60),
-            y_values=np.linspace(-1.9, -1.3, 12),
+            candidate_positions=np.column_stack((y_grid.ravel(), x_grid.ravel())),
             q_min=0.01,
             q_max=0.8,
             num_q_points=1000,

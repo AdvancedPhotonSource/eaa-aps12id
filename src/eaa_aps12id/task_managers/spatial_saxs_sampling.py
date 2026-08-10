@@ -101,8 +101,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
     def run(
         self,
-        x_values: np.ndarray | list[float] | tuple[float, ...],
-        y_values: np.ndarray | list[float] | tuple[float, ...],
+        candidate_positions: (
+            np.ndarray
+            | list[list[float]]
+            | list[tuple[float, float]]
+            | tuple[tuple[float, float], ...]
+        ),
         q_min: float = 0.001,
         q_max: float = 1.0,
         num_q_points: int = 256,
@@ -152,8 +156,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
         Parameters
         ----------
-        x_values, y_values : array-like
-            Coordinates defining the finite Cartesian candidate grid.
+        candidate_positions : array-like
+            Candidate spatial coordinates with shape ``(N, 2)`` in ``(y, x)``
+            column order. Rows retain the supplied order.
         max_measurements : int, optional
             Total acquisition budget, including initial measurements.
         n_iterations : int, optional
@@ -176,8 +181,7 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         self.num_candidates_per_suggestion = int(num_candidates_per_suggestion)
 
         self.engine_tool.initialize(
-            x_values=x_values,
-            y_values=y_values,
+            candidate_positions=candidate_positions,
             q_min=q_min,
             q_max=q_max,
             num_q_points=num_q_points,
@@ -315,17 +319,17 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         starting_count = len(self.measurements)
         for offset, position in enumerate(positions, start=1):
             self._record_progress_message(
-                f"Selected next SAXS position x={position[0]:.6g}, y={position[1]:.6g}."
+                f"Selected next SAXS position x={position[1]:.6g}, y={position[0]:.6g}."
             )
             q, intensity = self.acquire_saxs(
-                float(position[0]),
                 float(position[1]),
+                float(position[0]),
                 acquisition_kwargs,
             )
             q_values.append(q)
             intensities.append(intensity)
             message = (
-                f"Measured SAXS at x={position[0]:.6g}, y={position[1]:.6g} "
+                f"Measured SAXS at x={position[1]:.6g}, y={position[0]:.6g} "
                 f"({starting_count + offset}/{self.max_measurements})."
             )
             logger.info(message)
@@ -532,12 +536,12 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ax.set_ylabel("y")
         if values is None:
             ax.text(0.5, 0.5, "Not available", ha="center", va="center")
-            ax.set_xlim(engine.position_min[0], engine.position_max[0])
-            ax.set_ylim(engine.position_min[1], engine.position_max[1])
+            ax.set_xlim(engine.position_min[1], engine.position_max[1])
+            ax.set_ylim(engine.position_min[0], engine.position_max[0])
         else:
             scatter = ax.scatter(
-                positions[:, 0],
                 positions[:, 1],
+                positions[:, 0],
                 c=values,
                 cmap="viridis",
                 s=70,
@@ -545,8 +549,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             plt.colorbar(scatter, ax=ax)
         if sampled_positions.size:
             ax.scatter(
-                sampled_positions[:, 0],
                 sampled_positions[:, 1],
+                sampled_positions[:, 0],
                 facecolors="none",
                 edgecolors="white",
                 linewidths=1.5,
@@ -554,8 +558,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
                 label="sampled",
             )
             ax.scatter(
-                sampled_positions[:, 0],
                 sampled_positions[:, 1],
+                sampled_positions[:, 0],
                 facecolors="none",
                 edgecolors="black",
                 linewidths=0.8,
@@ -563,8 +567,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             )
         if latest_position is not None:
             ax.scatter(
-                [latest_position[0]],
                 [latest_position[1]],
+                [latest_position[0]],
                 marker="*",
                 c="red",
                 edgecolors="black",
