@@ -143,3 +143,28 @@ requested q coverage.
 Loads measured SAXS data and metadata from disk, constructs a spatial interpolation
 backend, and returns simulated q-intensity arrays through the same `acquire_saxs`
 interface used by the task manager.
+
+## Driver scripts
+
+Some driver scripts have been preapred to directly launch sessions and workflows with
+minimal modification. 
+
+### `run_main_agent.py`
+
+Launches the agent (backend) process and WebUI (frontend) process of a generic chat
+agent. An `MCPTool` that connects to the APS 12-ID MCP server is configured and
+registered to the agent. Additionally, a `SpatialSAXSAdaptiveSamplingTaskManager`
+is created, binding the `APS12IDSAXSAcquisitionTool` wrapper of the MCP tool,
+is created and registered to the chat agent's task manager as a sub-workflow. 
+The `APS12IDSAXSAcquisitionTool` wrapper is specifically used for a
+non-agent-driven, rule- or mathematics-based workflow which directly returns
+the numerical arrays of measured q values and intensities. Registering the
+`SpatialSAXSAdaptiveSamplingTaskManager` to the main task manager allows the main
+agent to launch this workflow as a sub-task from a chat interface.
+
+### `run_adaptive_sampling.py`
+
+This driver script only launches the `SpatialSAXSAdaptiveSamplingTaskManager`
+without a main chat agent. Similar to the setup in `run_main_agent.py`,
+the task manager binds the APS 12-ID data acquisition MCP tool wrapped by
+`APS12IDSAXSAcquisitionTool`.
