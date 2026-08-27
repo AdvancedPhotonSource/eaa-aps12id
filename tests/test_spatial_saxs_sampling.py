@@ -1,4 +1,5 @@
 import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -1005,6 +1006,29 @@ def test_run_collects_unique_measurements():
     assert len(manager.measurements) == 4
     assert len(set(manager.engine_tool.measured_candidate_indices)) == 4
     assert manager.latest_scores is not None
+
+
+@pytest.mark.parametrize("path_type", [str, Path])
+def test_run_loads_candidate_positions_from_npy_file(tmp_path, path_type):
+    candidate_positions = np.asarray(
+        default_sampling_kwargs()["candidate_positions"]
+    )
+    candidate_positions_path = tmp_path / "candidate_positions.npy"
+    np.save(candidate_positions_path, candidate_positions)
+    manager = make_manager()
+
+    manager.run(
+        **default_sampling_kwargs(
+            candidate_positions=path_type(candidate_positions_path),
+            num_q_points=64,
+            max_measurements=3,
+        )
+    )
+
+    np.testing.assert_array_equal(
+        manager.engine_tool.candidate_positions,
+        candidate_positions,
+    )
 
 
 def test_run_acquires_multiple_candidates_before_refitting():

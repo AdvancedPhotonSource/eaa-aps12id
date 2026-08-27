@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Literal
 
 import eaa_core.matplotlib_setup  # noqa: F401
@@ -106,6 +107,8 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
             | list[list[float]]
             | list[tuple[float, float]]
             | tuple[tuple[float, float], ...]
+            | str
+            | Path
         ),
         q_min: float = 0.001,
         q_max: float = 1.0,
@@ -156,9 +159,13 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
 
         Parameters
         ----------
-        candidate_positions : array-like
-            Candidate spatial coordinates with shape ``(N, 2)`` in ``(y, x)``
-            column order. Rows retain the supplied order.
+        candidate_positions : array-like, str, or pathlib.Path
+            Candidate spatial coordinates as a non-empty numeric array with
+            shape ``(N, 2)``. Each row is one candidate position; the first
+            column is ``y`` and the second is ``x``. All values must be finite,
+            and rows must be unique. Rows retain the supplied order. A string
+            or ``pathlib.Path`` must point to a ``.npy`` file containing this
+            array, such as one created by ``numpy.save``.
         max_measurements : int, optional
             Total acquisition budget, including initial measurements.
         n_iterations : int, optional
@@ -179,6 +186,9 @@ class SpatialSAXSAdaptiveSamplingTaskManager(BaseTaskManager):
         ):
             raise ValueError("`num_candidates_per_suggestion` must be positive.")
         self.num_candidates_per_suggestion = int(num_candidates_per_suggestion)
+
+        if isinstance(candidate_positions, (str, Path)):
+            candidate_positions = np.load(candidate_positions)
 
         self.engine_tool.initialize(
             candidate_positions=candidate_positions,
