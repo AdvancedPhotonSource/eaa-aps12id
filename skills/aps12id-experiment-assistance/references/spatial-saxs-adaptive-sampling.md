@@ -128,11 +128,41 @@ weighted peak-observable and spatial-gradient terms.
 | --- | --- | --- |
 | `non_position_kwargs_for_acquisition_tool` | `null` | Extra keyword arguments forwarded to `acquire_saxs(x=..., y=...)`, commonly `exposure`. With `null`, the manager passes engine `q_min` and `q_max` so the APS adapter validates returned q coverage. If a mapping is supplied, it replaces that default mapping rather than merging with it; include `q_min`/`q_max` explicitly when coverage validation is still wanted. |
 
-## Partial engine operations
+## Special case 1: launch the full workflow from Bash
 
-Do not launch the registered task manager if the user asks only to suggest, update,
+Normally, launch the registered `SpatialSAXSAdaptiveSamplingTaskManager` as described
+above. Use this fallback only when that class is not registered with the subagent tool,
+or when the registered `run` API does not expose everything required for the requested
+full adaptive-sampling workflow. This fallback still launches live, end-to-end
+acquisition; it is not the procedure for isolated engine operations.
+
+1. Copy
+   [the backend-only driver template](../scripts/run_adaptive_sampling.py) to a working
+   location and adapt the copy. Set the MCP endpoint, checkpoint and transcript paths,
+   candidate positions, acquisition arguments, and task-manager arguments needed for
+   the experiment. Preserve the candidate validation and coordinate conventions above.
+2. Keep the copied script backend-only. Do not enable `use_webui`, start a WebUI runtime,
+   call `launch_html_webui_subprocess`, or launch any other frontend process. The current
+   WebUI will display the Bash process output.
+3. Launch the adapted script with the Bash tool in its provided environment, for example
+   with `uv run python /absolute/path/to/run_adaptive_sampling.py`. Set the Bash tool's
+   `create_ui_tab` argument to `True` so the running script's output appears in a WebUI
+   tab. Use a timeout suitable for the full acquisition workflow.
+4. Treat a nonzero exit, timeout, MCP error, or task-manager error as a failed workflow;
+   do not report completion merely because the UI tab was created.
+
+## Special case 2: partial engine operations
+
+Do not use the task manager interface if the user asks only to suggest, update,
 analyze existing spectra, or perform another isolated phase. The task manager owns the
 entire acquisition loop and may collect live data.
+
+The Bayesian optimization-based suggestion and state update routines used in
+`SpatialSAXSAdaptiveSamplingTaskManager` can also be used separately without the task
+manager and the data collection logic. These routines are implemented in the
+`SpatialSAXSAdaptiveSamplingEngineTool` class. This engine tool exposes the interfaces
+of `initialize`, `suggest_initial_measurements`, `update`, and `suggest` for completing
+individual steps in the adaptive sampling process.
 
 Before viewing or calling the underlying algorithm, locate the installed package in the
 same Python environment as EAA:
@@ -144,13 +174,94 @@ python -c "import inspect; from eaa_aps12id.task_managers.spatial_saxs_sampling 
 
 The relevant modules are:
 
-- `eaa_aps12id.task_managers.spatial_saxs_sampling`
-- `eaa_aps12id.tools.spatial_saxs_sampling`
+- `eaa_aps12id.task_managers.spatial_saxs_sampling`: the task manager that calls the
+  engine tool in the defined workflow
+- `eaa_aps12id.tools.spatial_saxs_sampling`: the engine tool itself
+
+### Persistent engine service
+
+The engine is stateful but is not expected to be registered as an MCP server. Keep one
+engine instance alive in a local FastAPI process so later agent turns can call the same
+instance:
+
+**For large arrays, always save the numeric data to `.npy` files and pass only their
+absolute paths in the JSON request.** Do not serialize a large candidate grid, q array,
+intensity array, or measurement batch into a tool call. Inline JSON arrays are suitable
+only for small inputs. Passing paths keeps agent requests compact and lets the server
+load the arrays without the agent reproducing their values.
+
+1. Copy
+   [the engine server template](../scripts/run_adaptive_sampling_engine_server.py) to a
+   working location. Inspect the installed engine source first and adapt the copy if its
+   public method signatures differ from the template. Bind only to `127.0.0.1`, choose an
+   unused port, and do not configure multiple Uvicorn workers or auto-reload; either
+   would create or replace engine instances.
+2. Launch the copied server in the foreground with the Bash tool, for example:
+
+   ```bash
+   uv run python /absolute/path/to/run_adaptive_sampling_engine_server.py --port 8765
+   ```
+
+   The Bash tool is preconfigured with a `release_timeout`: when it releases the agent
+   loop, the server keeps running. Do not append `&`, use `nohup`, or launch a second
+   copy. Set `create_ui_tab` to `True` so server output remains visible in the current
+   WebUI.
+3. Call `GET /health` after launch. Record both the base URL and returned `engine_id`.
+   Before every later state-changing call, check `/health` or `/state` and require the
+   same `engine_id`. A different ID means the process restarted and the prior in-memory
+   engine state is gone.
+4. Call the HTTP endpoints in the engine's required stateful order:
+
+   | Endpoint | Purpose |
+   | --- | --- |
+   | `POST /initialize` | Configure a new engine instance. Send the engine's `initialize` keyword arguments as one JSON object. |
+   | `POST /suggest_initial_measurements` | Return the initial path-optimized positions. Call only before any update. |
+   | `POST /update` | Add measured `positions`, `q_values`, and `intensities`, then refit the model. |
+   | `POST /suggest` | Return adaptive positions. Send `{"n_suggestions": 1}` or another positive batch size. |
+   | `GET /state` | Check the engine ID, configuration status, and recorded measurement indices/count. |
+
+   Each array argument accepts either a small inline JSON array or an absolute `.npy`
+   path string. The path form is supported for `candidate_positions`,
+   `known_peak_q_values`, `positions`, `q_values`, and `intensities`. Prefer it whenever
+   an array would make the request large. The server process must be able to read the
+   file, and `.npy` contents must be regular numeric arrays loadable with
+   `allow_pickle=False`.
+
+Save large inputs before making the HTTP request:
+
+```python
+import numpy as np
+
+np.save("/shared/beamtime/candidates.npy", candidate_positions)
+np.save("/shared/beamtime/measured_positions.npy", measured_positions)
+np.save("/shared/beamtime/q_values.npy", q_values)
+np.save("/shared/beamtime/intensities.npy", intensities)
+```
+
+The corresponding request contains path strings, not the array values:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8765/initialize \
+  -H 'Content-Type: application/json' \
+  -d '{"candidate_positions":"/shared/beamtime/candidates.npy","q_min":0.01,"q_max":0.8,"num_initial_samples":5}'
+
+curl -sS -X POST http://127.0.0.1:8765/update \
+  -H 'Content-Type: application/json' \
+  -d '{"positions":"/shared/beamtime/measured_positions.npy","q_values":"/shared/beamtime/q_values.npy","intensities":"/shared/beamtime/intensities.npy"}'
+
+curl -sS -X POST http://127.0.0.1:8765/suggest \
+  -H 'Content-Type: application/json' \
+  -d '{"n_suggestions":1}'
+```
 
 The engine's stateful sequence is `initialize(...)`,
 `suggest_initial_measurements()`, `update(positions, q_values, intensities)`, then
-`suggest(n_suggestions=...)` and further updates. Custom code must preserve the exact
-candidate set, configuration, measured positions, and corresponding q/intensity spectra.
-If a partial request lacks the engine state or enough data to reconstruct it reliably,
-tell the user what is missing instead of fabricating measurements, inferred state, or
-recommendations.
+`suggest(n_suggestions=...)` and further updates. Do not reinitialize or stop the server
+while later updates are expected. The template serializes engine operations, but the
+agent should still avoid concurrent mutations.
+
+The service does not acquire data and does not persist engine state across process exits.
+If it stops, reconstruct state only by initializing with the exact original configuration
+and replaying every measured position with its corresponding q/intensity spectrum in the
+original order. If those inputs are unavailable, tell the user what is missing instead
+of fabricating measurements, inferred state, or recommendations.
