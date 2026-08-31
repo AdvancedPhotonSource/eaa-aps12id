@@ -23,7 +23,13 @@ Under the repository root, do
 source .venv/bin/activate
 ```
 
-3. To test the installation (and to launch the main agent):
+3. Set Argo API key:
+```
+export ARGO_API_KEY="your-argo-api-key"
+```
+You can save this in your `.bashrc` so that you don't have to set it everytime.
+
+4. To test the installation (and to launch the main agent):
 ```
 cd driver_scripts/
 python run_main_agent.py
