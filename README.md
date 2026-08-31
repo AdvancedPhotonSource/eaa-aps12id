@@ -5,6 +5,30 @@ acquisition adapters for automated experiments at APS 12-ID. The spatial SAXS
 implementation separates experiment orchestration from the Bayesian decision logic so
 the two parts can be used together or integrated independently.
 
+## Installation
+
+1. Install uv:
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+If this doesn't work, try
+```
+wget -qO- https://astral.sh/uv/install.sh | sh
+```
+
+2. Activate the uv environment
+
+Under the repository root, do
+```
+source .venv/bin/activate
+```
+
+3. To test the installation (and to launch the main agent):
+```
+cd driver_scripts/
+python run_main_agent.py
+```
+
 ## Organization
 
 ```text
